@@ -2,15 +2,14 @@ import express from 'express';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   MultiplayerRole,
   MultiplayerRoomManager,
   MultiplayerRoomState,
   normalizeRoomCode,
-} from './src/game/multiplayer';
-import { OperativeId, WeaponId } from './src/game/types';
+} from './src/game/multiplayer.ts';
+import { OperativeId, WeaponId } from './src/game/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,6 +24,18 @@ interface SocketSession {
 async function startServer() {
   const app = express();
   app.use(express.json());
+
+  // Allow cross-origin requests when frontend is hosted separately from backend
+  app.use('/api', (req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(204);
+      return;
+    }
+    next();
+  });
 
   const httpServer = http.createServer(app);
   const roomManager = new MultiplayerRoomManager();
@@ -151,6 +162,113 @@ async function startServer() {
       matchedImmediately: result.matchedImmediately,
       serverTime: Date.now(),
     });
+  });
+
+  // HTTP Event Fallback Endpoint when WebSocket upgrades are blocked by proxies
+  app.post('/api/multiplayer/event', (req, res) => {
+    const msg = req.body || {};
+    const code = normalizeRoomCode(String(msg.code || ''));
+    const role: MultiplayerRole = msg.role === 'guest' ? 'guest' : 'host';
+    const room = roomManager.getRoom(code);
+    if (!room) {
+      res.status(404).json({ ok: false, error: `Room ${code} not found.` });
+      return;
+    }
+
+    if (msg.type === 'mp:state') {
+      const updated = roomManager.updatePlayerTelemetry(code, role, {
+        x: msg.x,
+        y: msg.y,
+        z: msg.z,
+        vx: msg.vx,
+        vz: msg.vz,
+        yaw: msg.yaw,
+        pitch: msg.pitch,
+        weaponId: msg.weaponId,
+        armor: msg.armor,
+        armorType: msg.armorType,
+        credits: msg.credits,
+        isCrouching: msg.isCrouching,
+        isSliding: msg.isSliding,
+        isReloading: msg.isReloading,
+      });
+      if (updated) {
+        broadcastToRoom(code, {
+          type: 'mp:remote_state',
+          role,
+          player: updated,
+          serverTime: Date.now(),
+        });
+      }
+      res.json({ ok: true, room, serverTime: Date.now() });
+      return;
+    }
+
+    if (msg.type === 'mp:shoot') {
+      broadcastToRoom(code, {
+        type: 'mp:remote_shoot',
+        role,
+        weaponId: msg.weaponId,
+        originX: msg.originX,
+        originY: msg.originY,
+        originZ: msg.originZ,
+        endX: msg.endX,
+        endY: msg.endY,
+        endZ: msg.endZ,
+      });
+      res.json({ ok: true, serverTime: Date.now() });
+      return;
+    }
+
+    if (msg.type === 'mp:hit') {
+      const dmgEvent = roomManager.applyHitDamage({
+        code,
+        attackerRole: role,
+        weaponId: (msg.weaponId as WeaponId) || 'pistol',
+        rawDamage: Number(msg.rawDamage) || 26,
+        isHeadshot: Boolean(msg.isHeadshot),
+        distance: Number(msg.distance) || 10,
+        hitX: Number(msg.hitX) || 0,
+        hitY: Number(msg.hitY) || 1,
+        hitZ: Number(msg.hitZ) || 0,
+      });
+      const updatedRoom = roomManager.getRoom(code);
+      if (dmgEvent && updatedRoom) {
+        broadcastToRoom(code, {
+          type: 'mp:damage',
+          event: dmgEvent,
+          room: updatedRoom,
+          serverTime: Date.now(),
+        });
+      }
+      res.json({
+        ok: true,
+        event: dmgEvent,
+        room: updatedRoom,
+        serverTime: Date.now(),
+      });
+      return;
+    }
+
+    if (msg.type === 'mp:deploy_now') {
+      if (room.roundPhase === 'buy') {
+        room.roundPhase = 'combat';
+        room.phaseEndsAt = Date.now() + 95_000;
+        room.announcement = 'COMBAT LIVE // ELIMINATE RIVAL OPERATIVE';
+        broadcastRoomSync(room);
+      }
+      res.json({ ok: true, room, serverTime: Date.now() });
+      return;
+    }
+
+    if (msg.type === 'mp:rematch') {
+      roomManager.startMatchInRoom(room, Date.now());
+      broadcastRoomSync(room);
+      res.json({ ok: true, room, serverTime: Date.now() });
+      return;
+    }
+
+    res.json({ ok: true, room, serverTime: Date.now() });
   });
 
   // ==========================================================================
@@ -367,6 +485,7 @@ async function startServer() {
   // VITE DEV MIDDLEWARE OR PRODUCTION STATIC ASSETS
   // ==========================================================================
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -380,7 +499,7 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`VANGUARD 1v1 Tactical Server & Matchmaking live on http://0.0.0.0:${PORT}`);
   });

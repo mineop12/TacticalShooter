@@ -5,15 +5,17 @@ import {
   MultiplayerRoomState,
   normalizeRoomCode,
 } from '../game/multiplayer';
+import {
+  createRoomClient,
+  fetchWaitingRoomsClient,
+  fillWithSimulatedChallengerClient,
+  getRoomByCodeClient,
+  joinRoomByCodeClient,
+  PublicRoomSummary,
+  quickMatchClient,
+} from '../game/multiplayerClient';
 import { OperativeId } from '../game/types';
 import { OPERATIVES } from '../game/weapons';
-
-interface PublicRoomSummary {
-  code: string;
-  hostCallsign: string;
-  hostOperative: OperativeId;
-  createdAt: number;
-}
 
 interface MultiplayerModalProps {
   playerId: string;
@@ -48,12 +50,8 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
 
   const fetchWaitingRooms = useCallback(async () => {
     try {
-      const res = await fetch('/api/multiplayer/rooms');
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data.ok && Array.isArray(data.waitingRooms)) {
-        setWaitingRooms(data.waitingRooms);
-      }
+      const res = await fetchWaitingRoomsClient();
+      setWaitingRooms(res.waitingRooms);
     } catch {}
   }, []);
 
@@ -69,18 +67,15 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
     let active = true;
     const pollRoom = async () => {
       try {
-        const res = await fetch(`/api/multiplayer/room/${hostedRoom.code}`);
-        if (!res.ok || !active) return;
-        const data = await res.json();
-        if (data.ok && data.room) {
-          setHostedRoom(data.room);
-          if (data.room.guest) {
-            onLaunchMultiplayerMatch(data.room, 'host', callsign);
-          }
+        const res = await getRoomByCodeClient(hostedRoom.code);
+        if (!res.ok || !res.room || !active) return;
+        setHostedRoom(res.room);
+        if (res.room.guest) {
+          onLaunchMultiplayerMatch(res.room, 'host', callsign);
         }
       } catch {}
     };
-    const interval = window.setInterval(pollRoom, 800);
+    const interval = window.setInterval(pollRoom, 650);
     return () => {
       active = false;
       window.clearInterval(interval);
@@ -98,25 +93,16 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
     setLoadingAction(isPublicQueue ? 'public' : 'private');
     try {
       const finalCallsign = callsign.trim() || 'ALPHA-01';
-      const res = await fetch('/api/multiplayer/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          playerId,
-          callsign: finalCallsign,
-          operative: selectedOperative,
-          isPublicQueue,
-        }),
+      const data = await createRoomClient({
+        playerId,
+        callsign: finalCallsign,
+        operative: selectedOperative,
+        isPublicQueue,
       });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        setErrorMsg(data.error || 'Failed to create tactical room.');
-      } else {
-        setHostedRoom(data.room);
-        fetchWaitingRooms();
-      }
+      setHostedRoom(data.room);
+      fetchWaitingRooms();
     } catch {
-      setErrorMsg('Network error while contacting matchmaking server.');
+      setErrorMsg('Failed to initialize tactical room.');
     } finally {
       setLoadingAction(null);
     }
@@ -132,24 +118,19 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
     setLoadingAction('join');
     try {
       const finalCallsign = callsign.trim() || 'BRAVO-02';
-      const res = await fetch('/api/multiplayer/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          code: norm,
-          playerId,
-          callsign: finalCallsign,
-          operative: selectedOperative,
-        }),
+      const data = await joinRoomByCodeClient({
+        code: norm,
+        playerId,
+        callsign: finalCallsign,
+        operative: selectedOperative,
       });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
+      if (!data.ok) {
         setErrorMsg(data.error || `Could not join room ${norm}.`);
       } else {
         onLaunchMultiplayerMatch(data.room, data.role, finalCallsign);
       }
     } catch {
-      setErrorMsg('Network error while joining room.');
+      setErrorMsg(`Could not join room ${norm}.`);
     } finally {
       setLoadingAction(null);
     }
@@ -160,26 +141,35 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
     setLoadingAction('quickmatch');
     try {
       const finalCallsign = callsign.trim() || 'STRIKER-01';
-      const res = await fetch('/api/multiplayer/quickmatch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          playerId,
-          callsign: finalCallsign,
-          operative: selectedOperative,
-        }),
+      const data = await quickMatchClient({
+        playerId,
+        callsign: finalCallsign,
+        operative: selectedOperative,
       });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        setErrorMsg(data.error || 'Quick-match failed.');
-      } else if (data.matchedImmediately || data.room.guest) {
+      if (data.matchedImmediately || data.room.guest) {
         onLaunchMultiplayerMatch(data.room, data.role, finalCallsign);
       } else {
         setHostedRoom(data.room);
         fetchWaitingRooms();
       }
     } catch {
-      setErrorMsg('Network error while entering matchmaking queue.');
+      setErrorMsg('Failed to enter matchmaking queue.');
+    } finally {
+      setLoadingAction(null);
+    }
+  };
+
+  const handleFillSimulatedChallenger = async () => {
+    if (!hostedRoom) return;
+    setLoadingAction('simfill');
+    try {
+      const updatedRoom = await fillWithSimulatedChallengerClient(
+        hostedRoom.code,
+        selectedOperative
+      );
+      if (updatedRoom) {
+        onLaunchMultiplayerMatch(updatedRoom, 'host', callsign.trim() || 'ALPHA-01');
+      }
     } finally {
       setLoadingAction(null);
     }
@@ -304,20 +294,31 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
               </div>
 
               <div className="flex flex-col sm:items-end gap-2 w-full sm:w-auto">
-                <button
-                  type="button"
-                  data-testid="mp-enter-arena-host-btn"
-                  onClick={() =>
-                    onLaunchMultiplayerMatch(
-                      hostedRoom,
-                      'host',
-                      callsign.trim() || 'ALPHA-01'
-                    )
-                  }
-                  className="w-full sm:w-auto px-5 py-3 bg-rose-600 hover:bg-rose-500 text-white font-display font-bold text-sm uppercase tracking-wider transition-colors cursor-pointer whitespace-nowrap"
-                >
-                  Enter Arena Warmup Now
-                </button>
+                <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                  <button
+                    type="button"
+                    data-testid="mp-enter-arena-host-btn"
+                    onClick={() =>
+                      onLaunchMultiplayerMatch(
+                        hostedRoom,
+                        'host',
+                        callsign.trim() || 'ALPHA-01'
+                      )
+                    }
+                    className="w-full sm:w-auto px-4 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-display font-bold text-xs uppercase tracking-wider transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    Enter Arena Warmup Now
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="mp-fill-sim-challenger-btn"
+                    disabled={Boolean(loadingAction)}
+                    onClick={handleFillSimulatedChallenger}
+                    className="w-full sm:w-auto px-3.5 py-2.5 bg-cyan-500/20 hover:bg-cyan-500 text-cyan-300 hover:text-slate-950 border border-cyan-500/50 font-mono font-bold text-xs uppercase tracking-wider transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    {loadingAction === 'simfill' ? 'Deploying...' : 'Fill Simulated Challenger'}
+                  </button>
+                </div>
                 <span className="text-[11px] font-mono text-slate-400">
                   Match starts automatically when challenger joins
                 </span>

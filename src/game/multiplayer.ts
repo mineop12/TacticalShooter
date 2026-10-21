@@ -4,9 +4,9 @@ import {
   checkMatchVictory,
   STARTING_CREDITS,
   TARGET_ROUND_WINS,
-} from './rules';
-import { ArmorType, KillFeedEntry, OperativeId, RoundPhase, WeaponId } from './types';
-import { ARMOR_SPECS, WEAPONS } from './weapons';
+} from './rules.ts';
+import { ArmorType, KillFeedEntry, OperativeId, RoundPhase, WeaponId } from './types.ts';
+import { ARMOR_SPECS, WEAPONS } from './weapons.ts';
 
 export type MultiplayerRole = 'host' | 'guest';
 
@@ -174,6 +174,18 @@ export class MultiplayerRoomManager {
 
   public getRoom(code: string): MultiplayerRoomState | undefined {
     return this.rooms.get(normalizeRoomCode(code));
+  }
+
+  public upsertRoom(room: MultiplayerRoomState): MultiplayerRoomState {
+    const code = normalizeRoomCode(room.code);
+    const copy: MultiplayerRoomState = JSON.parse(JSON.stringify(room));
+    copy.code = code;
+    this.rooms.set(code, copy);
+    return copy;
+  }
+
+  public getAllRooms(): MultiplayerRoomState[] {
+    return Array.from(this.rooms.values());
   }
 
   public listPublicWaitingRooms(): MultiplayerRoomState[] {

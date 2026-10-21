@@ -4,7 +4,14 @@ import {
   isValidRoomCode,
   MultiplayerRoomManager,
   normalizeRoomCode,
-} from './multiplayer';
+} from './multiplayer.ts';
+import {
+  createRoomClient,
+  fetchWaitingRoomsClient,
+  fillWithSimulatedChallengerClient,
+  joinRoomByCodeClient,
+  quickMatchClient,
+} from './multiplayerClient.ts';
 import {
   calculateDamageWithArmor,
   calculateRoundEconomy,
@@ -439,5 +446,66 @@ test('reconcileAnimatedKillFeed manages entering, expiring, displaced exiting, a
   assert.equal(resolveKillFeedWeaponId({ weaponName: 'Vandal-AR' }), 'rifle');
 });
 
+test('multiplayerClient seamlessly falls back to local-mesh authority when hosted on static server or network fails', async () => {
+  const origFetch = globalThis.fetch;
+  try {
+    // Simulate static host returning 404 HTML page for /api/multiplayer/*
+    globalThis.fetch = (async () =>
+      new Response('<!DOCTYPE html><html><body>404 Not Found</body></html>', {
+        status: 404,
+        headers: { 'content-type': 'text/html' },
+      })) as typeof fetch;
 
+    const created = await createRoomClient({
+      playerId: 'static_host_1',
+      callsign: 'VEX-HOST',
+      operative: 'vex',
+      isPublicQueue: true,
+      preferredCode: 'ST9911',
+    });
 
+    assert.equal(created.ok, true);
+    assert.equal(created.transportMode, 'local-mesh');
+    assert.equal(created.room.code, 'ST9911');
+    assert.equal(created.role, 'host');
+
+    const waiting = await fetchWaitingRoomsClient();
+    assert.equal(waiting.transportMode, 'local-mesh');
+    assert.ok(waiting.waitingRooms.some((r) => r.code === 'ST9911'));
+
+    // Simulate network rejection (e.g., offline / unreachable server)
+    globalThis.fetch = (async () => {
+      throw new Error('Failed to fetch');
+    }) as typeof fetch;
+
+    const joined = await joinRoomByCodeClient({
+      code: 'st-9911',
+      playerId: 'static_guest_2',
+      callsign: 'NYX-GUEST',
+      operative: 'nyx',
+    });
+
+    assert.equal(joined.ok, true);
+    if (joined.ok) {
+      assert.equal(joined.role, 'guest');
+      assert.equal(joined.room.status, 'active');
+      assert.equal(joined.room.guest?.callsign, 'NYX-GUEST');
+    }
+
+    // Quick match & simulated challenger fill also succeed without server
+    const qm = await quickMatchClient({
+      playerId: 'solo_qm_player',
+      callsign: 'SOLO-QM',
+      operative: 'kai',
+    });
+    assert.equal(qm.ok, true);
+    assert.equal(qm.transportMode, 'local-mesh');
+
+    const filled = await fillWithSimulatedChallengerClient(qm.room.code, 'kai');
+    assert.ok(filled);
+    assert.equal(filled.status, 'active');
+    assert.equal(filled.guest?.callsign, 'PHANTOM-X9');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

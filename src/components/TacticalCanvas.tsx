@@ -15,6 +15,10 @@ import {
   MultiplayerRoomState,
 } from '../game/multiplayer';
 import {
+  createMultiplayerConnection,
+  MultiplayerConnectionHandle,
+} from '../game/multiplayerClient';
+import {
   calculateDamageWithArmor,
   calculateRoundEconomy,
   canPurchaseArmor,
@@ -1154,38 +1158,21 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     };
 
     // ====================================================================
-    // 7b. REAL-TIME 1V1 MULTIPLAYER WEBSOCKET CLIENT & SYNC MANAGER
+    // 7b. REAL-TIME 1V1 MULTIPLAYER TRANSPORT & SYNC MANAGER
     // ====================================================================
-    let mpSocket: WebSocket | null = null;
-    let mpReconnectTimer: number | null = null;
-    let mpPingInterval: number | null = null;
+    let mpConnection: MultiplayerConnectionHandle | null = null;
     let mpStateEmitAccum = 0;
 
     const closeMultiplayerSocket = () => {
-      if (mpReconnectTimer !== null) {
-        window.clearTimeout(mpReconnectTimer);
-        mpReconnectTimer = null;
-      }
-      if (mpPingInterval !== null) {
-        window.clearInterval(mpPingInterval);
-        mpPingInterval = null;
-      }
-      if (mpSocket) {
-        mpSocket.onclose = null;
-        mpSocket.onmessage = null;
-        mpSocket.onerror = null;
-        try {
-          mpSocket.close();
-        } catch {}
-        mpSocket = null;
+      if (mpConnection) {
+        mpConnection.close();
+        mpConnection = null;
       }
     };
 
     const sendMultiplayerMessage = (payload: Record<string, unknown>) => {
-      if (mpSocket && mpSocket.readyState === WebSocket.OPEN) {
-        try {
-          mpSocket.send(JSON.stringify(payload));
-        } catch {}
+      if (mpConnection) {
+        mpConnection.send(payload);
       }
     };
 
@@ -1327,150 +1314,114 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       playerId: string
     ) => {
       closeMultiplayerSocket();
-      const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${wsProto}//${window.location.host}/ws/match`;
-      const ws = new WebSocket(wsUrl);
-      mpSocket = ws;
+      mpConnection = createMultiplayerConnection({
+        code,
+        role,
+        playerId,
+        onMessage: (rawMsg) => {
+          try {
+            const msg = rawMsg as Record<string, any>;
+            if (!msg || typeof msg.type !== 'string') return;
 
-      ws.onopen = () => {
-        ws.send(
-          JSON.stringify({
-            type: 'mp:join_socket',
-            code,
-            role,
-            playerId,
-          })
-        );
-        mpPingInterval = window.setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: 'mp:ping',
-                clientSentAt: Date.now(),
-                lastRttMs: sim.pingMs,
-              })
-            );
-          }
-        }, 2000);
-      };
-
-      ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(String(ev.data));
-          if (!msg || typeof msg.type !== 'string') return;
-
-          if (msg.type === 'mp:pong') {
-            if (typeof msg.clientSentAt === 'number') {
-              sim.pingMs = Math.max(1, Math.min(999, Date.now() - msg.clientSentAt));
-            }
-            return;
-          }
-
-          if (msg.type === 'mp:room_sync' && msg.room) {
-            applyRoomSyncToSim(msg.room as MultiplayerRoomState, msg.serverTime || Date.now());
-            return;
-          }
-
-          if (msg.type === 'mp:remote_state' && msg.role !== sim.multiplayerRole && msg.player) {
-            const p = msg.player;
-            sim.opponentConnected = true;
-            sim.opponentCallsign = p.callsign || sim.opponentCallsign;
-            sim.remoteTargetX = Number.isFinite(p.x) ? p.x : sim.remoteTargetX;
-            sim.remoteTargetY = Number.isFinite(p.y) ? p.y : 0;
-            sim.remoteTargetZ = Number.isFinite(p.z) ? p.z : sim.remoteTargetZ;
-            sim.remoteTargetYaw = Number.isFinite(p.yaw) ? p.yaw : sim.remoteTargetYaw;
-            sim.remoteSpeed = Math.hypot(p.vx || 0, p.vz || 0);
-            sim.aiIsCrouching = Boolean(p.isCrouching || p.isSliding);
-            sim.aiArmor = typeof p.armor === 'number' ? p.armor : sim.aiArmor;
-            if (p.weaponId && p.weaponId !== sim.aiWeaponId) {
-              sim.aiWeaponId = p.weaponId;
-              aiRig.setEquippedWeapon(sim.aiWeaponId);
-            }
-            return;
-          }
-
-          if (msg.type === 'mp:remote_shoot' && msg.role !== sim.multiplayerRole) {
-            const shotWep: WeaponId = msg.weaponId || sim.aiWeaponId;
-            aiRig.muzzleFlash.visible = true;
-            aiRig.muzzleFlash.rotation.z = Math.random() * Math.PI;
-            sim.aiMuzzleFlashTimer = 0.065;
-            soundEngine.playWeaponFire(shotWep, true);
-
-            const aiPosAttr = aiTracerGeo.getAttribute('position') as THREE.BufferAttribute;
-            aiPosAttr.setXYZ(
-              0,
-              Number(msg.originX) || sim.aiX,
-              Number(msg.originY) || 1.35,
-              Number(msg.originZ) || sim.aiZ
-            );
-            aiPosAttr.setXYZ(
-              1,
-              Number(msg.endX) || sim.playerX,
-              Number(msg.endY) || 1.35,
-              Number(msg.endZ) || sim.playerZ
-            );
-            aiPosAttr.needsUpdate = true;
-            aiTracerMat.opacity = 0.9;
-            aiTracerTimer = 0.085;
-            return;
-          }
-
-          if (msg.type === 'mp:damage' && msg.event && msg.room) {
-            const dmgEv = msg.event as DamageResolutionEvent;
-            const room = msg.room as MultiplayerRoomState;
-
-            if (dmgEv.victimRole === sim.multiplayerRole) {
-              // Local player took damage from remote opponent
-              sim.playerHealth = dmgEv.newHealth;
-              sim.playerArmor = dmgEv.newArmor;
-              if (sim.playerArmor <= 0) sim.playerArmorType = 'none';
-              sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.34);
-              soundEngine.playPlayerHurt();
-              if (dmgEv.eliminated) {
-                sim.playerDeaths += 1;
-                soundEngine.playRoundTransition(false);
+            if (msg.type === 'mp:pong') {
+              if (typeof msg.clientSentAt === 'number') {
+                sim.pingMs = Math.max(1, Math.min(999, Date.now() - msg.clientSentAt));
               }
-            } else if (dmgEv.attackerRole === sim.multiplayerRole) {
-              // Local player's shot damaged remote opponent
-              sim.aiHealth = dmgEv.newHealth;
-              sim.aiArmor = dmgEv.newArmor;
-              sim.totalDamageDealt += dmgEv.damageApplied;
-              soundEngine.playHitMarker(dmgEv.isHeadshot, dmgEv.eliminated);
-              sim.lastHitFeedback = {
-                damage: dmgEv.damageApplied,
-                isHeadshot: dmgEv.isHeadshot,
-                isKill: dmgEv.eliminated,
-                timestamp: performance.now(),
-                worldX: dmgEv.hitX,
-                worldY: dmgEv.hitY,
-                worldZ: dmgEv.hitZ,
-              };
-              if (dmgEv.eliminated) {
-                sim.playerKills += 1;
-                sim.aiKoTimer = 0.45;
-                soundEngine.playRoundTransition(true);
-              }
+              return;
             }
 
-            applyRoomSyncToSim(room, msg.serverTime || Date.now());
-            return;
-          }
-        } catch {}
-      };
+            if (msg.type === 'mp:room_sync' && msg.room) {
+              applyRoomSyncToSim(msg.room as MultiplayerRoomState, msg.serverTime || Date.now());
+              return;
+            }
 
-      ws.onclose = () => {
-        if (sim.isMultiplayer && sim.appState !== 'title' && sim.multiplayerRoomCode) {
-          mpReconnectTimer = window.setTimeout(() => {
-            if (sim.isMultiplayer && sim.multiplayerRoomCode) {
-              connectMultiplayerSocket(
-                sim.multiplayerRoomCode,
-                sim.multiplayerRole,
-                sim.multiplayerPlayerId
+            if (msg.type === 'mp:remote_state' && msg.role !== sim.multiplayerRole && msg.player) {
+              const p = msg.player;
+              sim.opponentConnected = true;
+              sim.opponentCallsign = p.callsign || sim.opponentCallsign;
+              sim.remoteTargetX = Number.isFinite(p.x) ? p.x : sim.remoteTargetX;
+              sim.remoteTargetY = Number.isFinite(p.y) ? p.y : 0;
+              sim.remoteTargetZ = Number.isFinite(p.z) ? p.z : sim.remoteTargetZ;
+              sim.remoteTargetYaw = Number.isFinite(p.yaw) ? p.yaw : sim.remoteTargetYaw;
+              sim.remoteSpeed = Math.hypot(p.vx || 0, p.vz || 0);
+              sim.aiIsCrouching = Boolean(p.isCrouching || p.isSliding);
+              sim.aiArmor = typeof p.armor === 'number' ? p.armor : sim.aiArmor;
+              if (p.weaponId && p.weaponId !== sim.aiWeaponId) {
+                sim.aiWeaponId = p.weaponId;
+                aiRig.setEquippedWeapon(sim.aiWeaponId);
+              }
+              return;
+            }
+
+            if (msg.type === 'mp:remote_shoot' && msg.role !== sim.multiplayerRole) {
+              const shotWep: WeaponId = msg.weaponId || sim.aiWeaponId;
+              aiRig.muzzleFlash.visible = true;
+              aiRig.muzzleFlash.rotation.z = Math.random() * Math.PI;
+              sim.aiMuzzleFlashTimer = 0.065;
+              soundEngine.playWeaponFire(shotWep, true);
+
+              const aiPosAttr = aiTracerGeo.getAttribute('position') as THREE.BufferAttribute;
+              aiPosAttr.setXYZ(
+                0,
+                Number(msg.originX) || sim.aiX,
+                Number(msg.originY) || 1.35,
+                Number(msg.originZ) || sim.aiZ
               );
+              aiPosAttr.setXYZ(
+                1,
+                Number(msg.endX) || sim.playerX,
+                Number(msg.endY) || 1.35,
+                Number(msg.endZ) || sim.playerZ
+              );
+              aiPosAttr.needsUpdate = true;
+              aiTracerMat.opacity = 0.9;
+              aiTracerTimer = 0.085;
+              return;
             }
-          }, 1500);
-        }
-      };
+
+            if (msg.type === 'mp:damage' && msg.event && msg.room) {
+              const dmgEv = msg.event as DamageResolutionEvent;
+              const room = msg.room as MultiplayerRoomState;
+
+              if (dmgEv.victimRole === sim.multiplayerRole) {
+                // Local player took damage from remote opponent
+                sim.playerHealth = dmgEv.newHealth;
+                sim.playerArmor = dmgEv.newArmor;
+                if (sim.playerArmor <= 0) sim.playerArmorType = 'none';
+                sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.34);
+                soundEngine.playPlayerHurt();
+                if (dmgEv.eliminated) {
+                  sim.playerDeaths += 1;
+                  soundEngine.playRoundTransition(false);
+                }
+              } else if (dmgEv.attackerRole === sim.multiplayerRole) {
+                // Local player's shot damaged remote opponent
+                sim.aiHealth = dmgEv.newHealth;
+                sim.aiArmor = dmgEv.newArmor;
+                sim.totalDamageDealt += dmgEv.damageApplied;
+                soundEngine.playHitMarker(dmgEv.isHeadshot, dmgEv.eliminated);
+                sim.lastHitFeedback = {
+                  damage: dmgEv.damageApplied,
+                  isHeadshot: dmgEv.isHeadshot,
+                  isKill: dmgEv.eliminated,
+                  timestamp: performance.now(),
+                  worldX: dmgEv.hitX,
+                  worldY: dmgEv.hitY,
+                  worldZ: dmgEv.hitZ,
+                };
+                if (dmgEv.eliminated) {
+                  sim.playerKills += 1;
+                  sim.aiKoTimer = 0.45;
+                  soundEngine.playRoundTransition(true);
+                }
+              }
+
+              applyRoomSyncToSim(room, msg.serverTime || Date.now());
+              return;
+            }
+          } catch {}
+        },
+      });
     };
 
     // 8. Register External API for UI Components

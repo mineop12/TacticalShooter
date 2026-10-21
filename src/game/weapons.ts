@@ -6,7 +6,7 @@ import {
   OperativeProfile,
   WeaponId,
   WeaponStats,
-} from './types';
+} from './types.ts';
 
 export const WEAPON_ORDER: WeaponId[] = ['pistol', 'smg', 'shotgun', 'rifle', 'sniper'];
 

@@ -7,8 +7,8 @@ import {
   Waypoint,
   WeaponId,
   WeaponInstanceState,
-} from './types';
-import { AI_DIFFICULTY_CONFIGS, ARMOR_SPECS, WEAPONS } from './weapons';
+} from './types.ts';
+import { AI_DIFFICULTY_CONFIGS, ARMOR_SPECS, WEAPONS } from './weapons.ts';
 
 export const MAX_CREDITS = 9000;
 export const STARTING_CREDITS = 800;
