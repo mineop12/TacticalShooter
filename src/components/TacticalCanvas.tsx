@@ -582,8 +582,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         isMultiplayer: sim.isMultiplayer,
         multiplayerRoomCode: sim.multiplayerRoomCode,
         multiplayerRole: sim.multiplayerRole,
-        opponentCallsign: sim.opponentCallsign,
-        opponentOperative: sim.opponentOperative,
+        opponentCallsign: sim.opponentCallsign ?? undefined,
+        opponentOperative: sim.opponentOperative ?? undefined,
         opponentConnected: sim.opponentConnected,
         pingMs: sim.pingMs,
       });

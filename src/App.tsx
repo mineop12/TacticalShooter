@@ -132,7 +132,16 @@ export default function App() {
   const [hud, setHud] = useState<HudSnapshot>(INITIAL_HUD);
   const [buyMenuOpen, setBuyMenuOpen] = useState(false);
   const [titleSettingsOpen, setTitleSettingsOpen] = useState(false);
-  const [multiplayerModalOpen, setMultiplayerModalOpen] = useState(false);
+  const [initialRoomCode] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    try {
+      const params = new URLSearchParams(window.location.search);
+      return (params.get('room') || params.get('code') || '').toUpperCase().trim();
+    } catch {
+      return '';
+    }
+  });
+  const [multiplayerModalOpen, setMultiplayerModalOpen] = useState(() => Boolean(initialRoomCode));
 
   const engineApiRef = useRef<TacticalEngineAPI | null>(null);
 
@@ -234,6 +243,7 @@ export default function App() {
           playerId={playerId}
           selectedOperative={profile.operative}
           defaultCallsign={profile.callsign}
+          initialRoomCode={initialRoomCode}
           onSaveCallsign={(callsign) => setProfile((p) => ({ ...p, callsign }))}
           onLaunchMultiplayerMatch={handleLaunchMultiplayerMatch}
           onClose={() => setMultiplayerModalOpen(false)}

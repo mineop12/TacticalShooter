@@ -9,10 +9,14 @@ import {
   createRoomClient,
   fetchWaitingRoomsClient,
   fillWithSimulatedChallengerClient,
+  getCustomServerUrl,
+  getDetectedTransportMode,
   getRoomByCodeClient,
+  isVercelHost,
   joinRoomByCodeClient,
   PublicRoomSummary,
   quickMatchClient,
+  setCustomServerUrl,
 } from '../game/multiplayerClient';
 import { OperativeId } from '../game/types';
 import { OPERATIVES } from '../game/weapons';
@@ -21,6 +25,7 @@ interface MultiplayerModalProps {
   playerId: string;
   selectedOperative: OperativeId;
   defaultCallsign: string;
+  initialRoomCode?: string;
   onSaveCallsign: (callsign: string) => void;
   onLaunchMultiplayerMatch: (
     room: MultiplayerRoomState,
@@ -34,17 +39,27 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
   playerId,
   selectedOperative,
   defaultCallsign,
+  initialRoomCode,
   onSaveCallsign,
   onLaunchMultiplayerMatch,
   onClose,
 }) => {
   const [callsign, setCallsign] = useState(defaultCallsign || 'STRIKER-01');
-  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [joinCodeInput, setJoinCodeInput] = useState(
+    initialRoomCode ? normalizeRoomCode(initialRoomCode) : ''
+  );
   const [hostedRoom, setHostedRoom] = useState<MultiplayerRoomState | null>(null);
   const [waitingRooms, setWaitingRooms] = useState<PublicRoomSummary[]>([]);
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
+  const [showNetworkSettings, setShowNetworkSettings] = useState(false);
+  const [customUrlInput, setCustomUrlInput] = useState(() => getCustomServerUrl());
+  const [customUrlSaved, setCustomUrlSaved] = useState(false);
+
+  const isVercel = isVercelHost();
+  const transportMode = getDetectedTransportMode();
 
   const opProfile = OPERATIVES[selectedOperative];
 
@@ -183,6 +198,24 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
     } catch {}
   };
 
+  const handleCopyInviteLink = async (code: string) => {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set('room', code);
+      await navigator.clipboard.writeText(url.toString());
+      setCopiedLink(true);
+      window.setTimeout(() => setCopiedLink(false), 2000);
+    } catch {}
+  };
+
+  const handleSaveCustomUrl = (e: React.FormEvent) => {
+    e.preventDefault();
+    setCustomServerUrl(customUrlInput);
+    setCustomUrlSaved(true);
+    fetchWaitingRooms();
+    window.setTimeout(() => setCustomUrlSaved(false), 2500);
+  };
+
   return (
     <div
       role="dialog"
@@ -199,22 +232,99 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
               <h2 className="font-display font-bold text-lg sm:text-xl tracking-wider uppercase text-white">
                 1v1 Tactical Matchmaking // Code & Queue
               </h2>
+              <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-slate-900 border border-slate-700 text-[10px] font-mono text-cyan-300 uppercase">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                {transportMode === 'webrtc'
+                  ? 'WebRTC Cloud P2P'
+                  : transportMode === 'server'
+                  ? 'Dedicated Server'
+                  : 'Cross-Device Mesh'}
+              </span>
             </div>
             <p className="text-xs font-mono text-slate-400 mt-0.5">
-              REAL-TIME WEBSOCKET SERVER · FIRST TO 13 ROUNDS · AUTHORITATIVE HIT & ECONOMY SYNC
+              CROSS-DEVICE PEER MESH · FIRST TO 13 ROUNDS · AUTHORITATIVE HIT & ECONOMY SYNC
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-xs font-semibold uppercase tracking-wider border border-slate-600 transition-colors cursor-pointer"
-          >
-            Back [Esc]
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowNetworkSettings((prev) => !prev)}
+              title="Configure Network & Server"
+              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono text-xs uppercase tracking-wider border border-slate-600 transition-colors cursor-pointer"
+            >
+              {showNetworkSettings ? 'Hide Network' : 'Network ⚙'}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-xs font-semibold uppercase tracking-wider border border-slate-600 transition-colors cursor-pointer"
+            >
+              Back [Esc]
+            </button>
+          </div>
         </div>
 
+        {/* Network & Server Settings Drawer */}
+        {showNetworkSettings && (
+          <div className="bg-[#070b14] border-b border-slate-700 px-6 py-4 flex flex-col gap-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-mono text-cyan-300 font-bold uppercase tracking-wider">
+                TACTICAL NETWORK & MULTIPLAYER SERVER ROUTING
+              </span>
+              <span className="text-[11px] font-mono text-slate-400">
+                Active Transport: <strong className="text-white uppercase">{transportMode}</strong>
+              </span>
+            </div>
+            <form onSubmit={handleSaveCustomUrl} className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="text"
+                value={customUrlInput}
+                onChange={(e) => setCustomUrlInput(e.target.value)}
+                placeholder="Optional custom WebSocket/REST server URL (e.g. https://...)"
+                className="flex-1 bg-[#0d1424] border border-slate-700 focus:border-cyan-400 text-white font-mono text-xs px-3 py-2 outline-none"
+              />
+              <button
+                type="submit"
+                className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-mono font-bold text-xs uppercase tracking-wider transition-colors cursor-pointer whitespace-nowrap"
+              >
+                {customUrlSaved ? 'Saved!' : 'Save Server URL'}
+              </button>
+              {customUrlInput && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCustomUrlInput('');
+                    setCustomServerUrl('');
+                    setCustomUrlSaved(true);
+                    fetchWaitingRooms();
+                    window.setTimeout(() => setCustomUrlSaved(false), 2000);
+                  }}
+                  className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono text-xs uppercase border border-slate-600 transition-colors cursor-pointer"
+                >
+                  Reset
+                </button>
+              )}
+            </form>
+            <p className="text-[11px] font-mono text-slate-400">
+              Leave blank to use automatic WebRTC Cloud P2P mesh (works out of the box on Vercel with zero setup).
+            </p>
+          </div>
+        )}
+
         <div className="p-5 sm:p-6 flex flex-col gap-5">
+          {/* Vercel Hosting Tip Notice */}
+          {isVercel && (
+            <div className="bg-amber-950/40 border border-amber-500/50 p-3.5 flex flex-col gap-1.5 text-xs font-mono text-amber-200">
+              <div className="font-bold uppercase tracking-wider text-amber-400 flex items-center gap-2">
+                <span>⚡ HOSTED ON VERCEL // P2P CLOUD MATCHMAKING READY</span>
+              </div>
+              <p className="text-[11px] text-amber-300/90 leading-relaxed">
+                1v1 matches communicate directly peer-to-peer via WebRTC across different devices! If your opponent is redirected to a Vercel login screen when opening your link, go to your <strong>Vercel Dashboard &gt; Project Settings &gt; Deployment Protection</strong> and turn off <em>Vercel Authentication</em> so anyone can join.
+              </p>
+            </div>
+          )}
+
           {/* Row 1: Operative Identity & Callsign */}
           <div className="grid grid-cols-1 sm:grid-cols-12 gap-4 items-center bg-[#0f1624] p-4 border border-slate-800">
             <div className="sm:col-span-6 flex flex-col gap-1">
@@ -272,7 +382,7 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
                     ROOM READY // SHARE 6-DIGIT CODE WITH OPPONENT
                   </span>
                 </div>
-                <div className="flex items-center gap-3 mt-1">
+                <div className="flex items-center gap-3 mt-1 flex-wrap">
                   <span
                     data-testid="mp-room-code-display"
                     className="font-mono font-bold text-3xl sm:text-4xl tracking-[0.22em] text-white bg-[#060911] px-4 py-2 border border-cyan-500/50 select-all"
@@ -284,7 +394,14 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
                     onClick={() => handleCopyCode(hostedRoom.code)}
                     className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-mono text-xs font-semibold uppercase border border-cyan-500/40 transition-colors cursor-pointer"
                   >
-                    {copiedCode ? 'Copied!' : 'Copy Code'}
+                    {copiedCode ? 'Copied Code!' : 'Copy Code'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleCopyInviteLink(hostedRoom.code)}
+                    className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-mono text-xs font-bold uppercase transition-colors cursor-pointer shadow"
+                  >
+                    {copiedLink ? 'Link Copied!' : 'Copy Invite Link'}
                   </button>
                 </div>
                 <span className="text-xs font-mono text-slate-300 mt-1">
