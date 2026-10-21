@@ -1,0 +1,119 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Chakra Petch', sans-serif;
+    --font-sans: 'Plus Jakarta Sans', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  * {
+    box-sizing: border-box;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background-color: #0b0f17;
+    color: #f1f5f9;
+    font-family: var(--font-sans);
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-sans {
+  font-family: var(--font-sans);
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-text-stroke {
+  paint-order: stroke fill;
+  -webkit-text-stroke: 3px rgba(9, 13, 22, 0.92);
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.85);
+}
+
+.hud-glow-cyan {
+  text-shadow: 0 0 10px rgba(56, 189, 248, 0.45), 0 2px 6px rgba(0, 0, 0, 0.85);
+}
+
+.hud-glow-emerald {
+  text-shadow: 0 0 10px rgba(16, 185, 129, 0.45), 0 2px 6px rgba(0, 0, 0, 0.85);
+}
+
+.hud-glow-rose {
+  text-shadow: 0 0 10px rgba(244, 63, 94, 0.48), 0 2px 6px rgba(0, 0, 0, 0.85);
+}
+
+.hud-panel-glow-cyan {
+  box-shadow: 0 0 18px rgba(6, 182, 212, 0.24), inset 0 0 10px rgba(6, 182, 212, 0.08);
+}
+
+.hud-panel-glow-rose {
+  box-shadow: 0 0 16px rgba(244, 63, 94, 0.28), inset 0 0 8px rgba(244, 63, 94, 0.1);
+}
+
+@keyframes killfeed-enter {
+  0% {
+    opacity: 0;
+    transform: translate3d(32px, -4px, 0) scale(0.95);
+    filter: brightness(1.55);
+  }
+  65% {
+    opacity: 1;
+    transform: translate3d(-2px, 0, 0) scale(1.01);
+    filter: brightness(1.12);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    filter: brightness(1);
+  }
+}
+
+@keyframes killfeed-exit {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    max-height: 38px;
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(28px, -4px, 0) scale(0.94);
+    max-height: 0px;
+    padding-top: 0px;
+    padding-bottom: 0px;
+    border-top-width: 0px;
+    border-bottom-width: 0px;
+  }
+}
+
+.killfeed-item-enter {
+  animation: killfeed-enter 0.32s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  will-change: transform, opacity;
+}
+
+.killfeed-item-exit {
+  animation: killfeed-exit 0.28s cubic-bezier(0.4, 0, 1, 1) forwards;
+  will-change: transform, opacity, max-height;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+

@@ -1,0 +1,6 @@
+{
+  "name": "VANGUARD // 1v1 Tactical Shooter",
+  "description": "Competitive 3D first-person 1v1 tactical shooter with round-based economy, five distinct weapons, intelligent line-of-sight AI opponent, and procedural tactical arena.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
