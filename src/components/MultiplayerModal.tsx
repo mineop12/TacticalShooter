@@ -7,6 +7,7 @@ import {
 } from '../game/multiplayer';
 import {
   createRoomClient,
+  ensureHostRoomPublished,
   fetchWaitingRoomsClient,
   fillWithSimulatedChallengerClient,
   getCustomServerUrl,
@@ -63,25 +64,27 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
 
   const opProfile = OPERATIVES[selectedOperative];
 
-  const fetchWaitingRooms = useCallback(async () => {
+  const fetchWaitingRooms = useCallback(async (scanBeacons = false) => {
     try {
-      const res = await fetchWaitingRoomsClient();
+      const res = await fetchWaitingRoomsClient(scanBeacons);
       setWaitingRooms(res.waitingRooms);
     } catch {}
   }, []);
 
   useEffect(() => {
-    fetchWaitingRooms();
-    const timer = window.setInterval(fetchWaitingRooms, 2500);
+    fetchWaitingRooms(true);
+    const timer = window.setInterval(() => fetchWaitingRooms(false), 3000);
     return () => window.clearInterval(timer);
   }, [fetchWaitingRooms]);
 
-  // If waiting in modal for challenger to join hosted room, poll room status & auto-launch when guest joins
+  // If waiting in modal for challenger to join hosted room, keep WebRTC host published & auto-launch when guest joins
   useEffect(() => {
     if (!hostedRoom) return;
     let active = true;
+    ensureHostRoomPublished(hostedRoom);
     const pollRoom = async () => {
       try {
+        ensureHostRoomPublished(hostedRoom);
         const res = await getRoomByCodeClient(hostedRoom.code);
         if (!res.ok || !res.room || !active) return;
         setHostedRoom(res.room);
@@ -548,7 +551,7 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
               </span>
               <button
                 type="button"
-                onClick={fetchWaitingRooms}
+                onClick={() => fetchWaitingRooms(true)}
                 className="text-xs font-sans text-cyan-400 hover:text-cyan-300 cursor-pointer uppercase font-medium"
               >
                 ↻ Refresh List
