@@ -70,6 +70,7 @@ export interface GameSettings {
   graphicsQuality: 'performance' | 'balanced' | 'ultra';
   showMinimap: boolean;
   crosshairColor: string;
+  showFps?: boolean;
 }
 
 export interface AABB {
@@ -81,7 +82,40 @@ export interface AABB {
   minZ: number;
   maxZ: number;
   isCover?: boolean;
+  isWallRunPanel?: boolean;
   label?: string;
+}
+
+export interface RopeAnchor {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  z: number;
+  ropeLength: number;
+  grabRadius: number;
+}
+
+export interface JumpPad {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  z: number;
+  radius: number;
+  boostVy: number;
+  boostForward: number;
+}
+
+export interface WallContact {
+  wallId: string;
+  normalX: number;
+  normalZ: number;
+  tangentX: number;
+  tangentZ: number;
+  side: 'left' | 'right';
+  distance: number;
+  isWallRunPanel: boolean;
 }
 
 export interface Waypoint {
@@ -165,6 +199,12 @@ export interface HudSnapshot {
   isCrouching: boolean;
   isSliding: boolean;
   isWalking: boolean;
+  isWallRunning?: boolean;
+  wallRunSide?: 'left' | 'right' | null;
+  isSwinging?: boolean;
+  activeRopeAnchorId?: string | null;
+  nearbyRopeAnchor?: RopeAnchor | null;
+  canWallJump?: boolean;
   aiHealth: number;
   aiMaxHealth: number;
   aiArmor: number;
@@ -190,4 +230,7 @@ export interface HudSnapshot {
   opponentOperative?: OperativeId;
   opponentConnected?: boolean;
   pingMs?: number;
+  fps?: number;
+  frameTimeMs?: number;
 }
+

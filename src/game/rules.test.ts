@@ -19,11 +19,19 @@ import {
   canPurchaseWeapon,
   checkMatchVictory,
   computeFireCyclePose,
+  computeRopeSwingStep,
   computeSlideVelocityFactor,
+  computeSubtleAimAssist,
+  computeWallJumpImpulse,
+  computeWallRunStep,
   computeWeaponInspectPose,
   computeWeaponReloadPose,
+  cycleWeaponSelection,
+  detectRunnableWall,
   evaluateAITacticalState,
+  findBestRopeAnchor,
   findBestTacticalWaypoint,
+  findSupportFloorHeight,
   hasCorridorClearance,
   hasLineOfSight,
   reconcileAnimatedKillFeed,
@@ -32,7 +40,7 @@ import {
   selectAICombatWeapon,
   selectAILoadoutForRound,
 } from './rules';
-import { AABB, KillFeedEntry, Waypoint, WeaponId, WeaponInstanceState } from './types';
+import { AABB, KillFeedEntry, RopeAnchor, Waypoint, WeaponId, WeaponInstanceState } from './types';
 
 test('calculateDamageWithArmor applies 66% shield absorption and eliminates at 0 HP', () => {
   const unarmored = calculateDamageWithArmor(160, 100, 0, 10, 100, 50);
@@ -509,3 +517,123 @@ test('multiplayerClient seamlessly falls back to local-mesh authority when hoste
     globalThis.fetch = origFetch;
   }
 });
+
+test('cycleWeaponSelection cycles to next/prev owned weapons on mouse wheel and wraps around', () => {
+  const owned = {
+    pistol: { id: 'pistol', ammoInMag: 12, ammoReserve: 36 },
+    rifle: { id: 'rifle', ammoInMag: 25, ammoReserve: 75 },
+    sniper: { id: 'sniper', ammoInMag: 5, ammoReserve: 15 },
+  };
+
+  // From pistol (order: pistol, rifle, sniper):
+  assert.equal(cycleWeaponSelection(owned, 'pistol', 'next'), 'rifle');
+  assert.equal(cycleWeaponSelection(owned, 'rifle', 'next'), 'sniper');
+  assert.equal(cycleWeaponSelection(owned, 'sniper', 'next'), 'pistol'); // wrap around
+
+  // Previous (scroll up):
+  assert.equal(cycleWeaponSelection(owned, 'pistol', 'prev'), 'sniper'); // wrap backwards
+  assert.equal(cycleWeaponSelection(owned, 'sniper', 'prev'), 'rifle');
+  assert.equal(cycleWeaponSelection(owned, 'rifle', 'prev'), 'pistol');
+
+  // Single weapon owned: stays on that weapon
+  const singleOwned = { pistol: { id: 'pistol', ammoInMag: 12, ammoReserve: 36 } };
+  assert.equal(cycleWeaponSelection(singleOwned, 'pistol', 'next'), 'pistol');
+  assert.equal(cycleWeaponSelection(singleOwned, 'pistol', 'prev'), 'pistol');
+});
+
+test('findSupportFloorHeight allows players to land on and walk across elevated platforms and crates', () => {
+  const highPlatform: AABB = {
+    id: 'catwalk_mid',
+    minX: -2,
+    maxX: 2,
+    minY: 0,
+    maxY: 2.8,
+    minZ: -2,
+    maxZ: 2,
+  };
+
+  // Player descending from y = 3.0 to y = 2.75 above the platform lands on y = 2.8
+  assert.equal(findSupportFloorHeight(0, 0, 3.0, 2.75, 0.44, [highPlatform]), 2.8);
+
+  // Player off the platform edge returns to ground level (0)
+  assert.equal(findSupportFloorHeight(4.0, 0, 2.8, 2.6, 0.44, [highPlatform]), 0);
+});
+
+test('detectRunnableWall, computeWallRunStep, and computeWallJumpImpulse power wall-running and wall-jumping', () => {
+  const wallPanel: AABB = {
+    id: 'wallrun_west',
+    minX: -13.2,
+    maxX: -11.8,
+    minY: 0,
+    maxY: 4.5,
+    minZ: -12,
+    maxZ: 12,
+    isWallRunPanel: true,
+  };
+
+  // Airborne player at x = -11.25 moving north (vz = -7.0, yaw = 0) near east face of wallPanel
+  const contact = detectRunnableWall(-11.25, 1.5, 0, 0, -7.0, 0, [wallPanel]);
+  assert.ok(contact);
+  assert.equal(contact.wallId, 'wallrun_west');
+  assert.equal(contact.normalX, 1);
+  assert.equal(contact.normalZ, 0);
+  assert.equal(contact.side, 'left'); // Wall is to the player's left when facing north
+
+  // Wall-run step maintains fast forward glide along the wall and counteracts gravity
+  const step = computeWallRunStep(0, -2.5, -7.0, contact, 0.2, 0.016);
+  assert.equal(step.shouldDetach, false);
+  assert.ok(Math.abs(step.vz) >= 8.2);
+  assert.ok(step.vy > -1.0); // Reduced fall speed
+  assert.ok(step.targetRoll > 0.1); // Camera tilts right when wall is on the left
+
+  // Wall-jump impulse launches player upward and pushes away from the wall normal
+  const jump = computeWallJumpImpulse(step.vx, step.vz, 0, contact);
+  assert.ok(jump.vy >= 8.0);
+  assert.ok(jump.vx >= 5.5); // Pushed away in +X normal direction
+  assert.ok(jump.vz < -5.0); // Preserves forward northward momentum
+});
+
+test('findBestRopeAnchor and computeRopeSwingStep power 3D pendulum rope swinging while keeping gunplay active', () => {
+  const anchors: RopeAnchor[] = [
+    {
+      id: 'rope_mid_bridge',
+      label: 'MID SKYBRIDGE GRAPPLE',
+      x: 0,
+      y: 7.4,
+      z: 0,
+      ropeLength: 4.6,
+      grabRadius: 9.5,
+    },
+  ];
+
+  // Player approaching mid at (0, 1.2, 5.5) looking north/upward finds the overhead rope anchor
+  const found = findBestRopeAnchor(0, 1.2, 5.5, 0, 0.25, anchors);
+  assert.ok(found);
+  assert.equal(found.id, 'rope_mid_bridge');
+
+  // Swinging step constrains player harness (y + 1.2) to pendulum arc and accelerates forward swing
+  const swing = computeRopeSwingStep(0, 2.8, 3.8, 0, -1.0, -6.5, 0, -1, found, 4.6, 0.05);
+  assert.ok(swing.z < 3.8); // Moves northward along pendulum arc
+  const distToAnchor = Math.hypot(swing.x - found.x, swing.y + 1.2 - found.y, swing.z - found.z);
+  assert.ok(distToAnchor <= 4.65); // Constrained by rope length
+  assert.ok(Math.hypot(swing.vx, swing.vy, swing.vz) > 4.0);
+});
+
+test('computeSubtleAimAssist provides gentle tracking nudge inside a narrow cone and ignores wide angles', () => {
+  // Target is due North at (0, 0, -15) while player eye is at (0, 1.66, 0)
+  // Looking slightly off-center (yaw = 0.035 rad ~ 2.0 deg, pitch = -0.01 rad) engages subtle assist
+  const nearTarget = computeSubtleAimAssist(0, 1.66, 0, 0.035, -0.01, 0, 0, -15, 0.016, false);
+  assert.equal(nearTarget.engaged, true);
+  assert.ok(Math.abs(nearTarget.nextYaw) < 0.035); // Gently nudged closer to 0.0 ideal yaw
+  assert.ok(nearTarget.sensitivityScale < 1.0 && nearTarget.sensitivityScale >= 0.82);
+  assert.ok(nearTarget.magnetStrength > 0 && nearTarget.magnetStrength <= 0.35);
+
+  // Looking far away from target (yaw = 0.35 rad ~ 20 deg) does not engage aim assist at all
+  const farOff = computeSubtleAimAssist(0, 1.66, 0, 0.35, 0, 0, 0, -15, 0.016, true);
+  assert.equal(farOff.engaged, false);
+  assert.equal(farOff.nextYaw, 0.35);
+  assert.equal(farOff.sensitivityScale, 1.0);
+  assert.equal(farOff.magnetStrength, 0);
+});
+
+

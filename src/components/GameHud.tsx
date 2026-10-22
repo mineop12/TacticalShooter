@@ -12,6 +12,7 @@ interface GameHudProps {
   hud: HudSnapshot;
   crosshairColor: string;
   showMinimap: boolean;
+  showFps?: boolean;
   muted: boolean;
   onToggleMute: () => void;
   onOpenBuyMenu: () => void;
@@ -21,6 +22,7 @@ interface GameHudProps {
   onEquipWeapon: (id: WeaponId) => void;
   onDeployNow: () => void;
   onInteractObjective: () => void;
+  onTriggerRopeSwing?: () => void;
   onPracticeAction: (
     action: 'refill_credits' | 'spawn_bot_mid' | 'sim_round_win' | 'sim_match_win' | 'heal_player'
   ) => void;
@@ -30,6 +32,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   hud,
   crosshairColor,
   showMinimap,
+  showFps = true,
   muted,
   onToggleMute,
   onOpenBuyMenu,
@@ -39,6 +42,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   onEquipWeapon,
   onDeployNow,
   onInteractObjective,
+  onTriggerRopeSwing,
   onPracticeAction,
 }) => {
   const activeWeaponSpec = WEAPONS[hud.activeWeapon.id];
@@ -80,15 +84,19 @@ export const GameHud: React.FC<GameHudProps> = ({
   const pMini = worldToMini(hud.playerPosition.x, hud.playerPosition.z);
   const aiMini = worldToMini(hud.aiPosition.x, hud.aiPosition.z);
 
-  const stanceLabel = hud.isSliding
-    ? 'SLIDING'
-    : hud.isCrouching
-      ? 'CROUCH'
-      : hud.isWalking
-        ? 'WALK'
-        : hud.isAiming
-          ? 'ADS FOCUS'
-          : 'READY';
+  const stanceLabel = hud.isSwinging
+    ? 'ROPE SWING'
+    : hud.isWallRunning
+      ? `WALL RUN ${hud.wallRunSide ? hud.wallRunSide.toUpperCase() : ''}`.trim()
+      : hud.isSliding
+        ? 'SLIDING'
+        : hud.isCrouching
+          ? 'CROUCH'
+          : hud.isWalking
+            ? 'WALK'
+            : hud.isAiming
+              ? 'ADS FOCUS'
+              : 'READY';
 
   return (
     <div className="fixed inset-0 z-10 pointer-events-none select-none overflow-hidden">
@@ -223,24 +231,77 @@ export const GameHud: React.FC<GameHudProps> = ({
                 className="bg-[#0d1424] border border-slate-800"
                 aria-label="Tactical Minimap"
               >
-                {/* Arena Boundary & Sector Guides */}
-                <rect x="8" y="8" width="124" height="124" fill="#111a2e" stroke="#334155" strokeWidth="1.5" />
-                <line x1="8" y1="70" x2="132" y2="70" stroke="#06b6d4" strokeWidth="0.7" strokeDasharray="3 3" strokeOpacity="0.5" />
+                {/* Tactical Radar Grid & Range Rings */}
+                <rect x="6" y="6" width="128" height="128" rx="2" fill="#090f1d" stroke="#1e293b" strokeWidth="1.5" />
+                <circle cx="70" cy="70" r="54" fill="none" stroke="#06b6d4" strokeWidth="0.6" strokeDasharray="2 3" strokeOpacity="0.25" />
+                <circle cx="70" cy="70" r="32" fill="none" stroke="#06b6d4" strokeWidth="0.6" strokeDasharray="2 3" strokeOpacity="0.35" />
+                <line x1="6" y1="70" x2="134" y2="70" stroke="#06b6d4" strokeWidth="0.8" strokeDasharray="3 3" strokeOpacity="0.3" />
+                <line x1="70" y1="6" x2="70" y2="134" stroke="#06b6d4" strokeWidth="0.8" strokeDasharray="3 3" strokeOpacity="0.2" />
+
                 {/* West A-Long & East B-Link Lane Dividers */}
-                <rect x="40" y="26" width="4" height="30" fill="#475569" />
-                <rect x="40" y="84" width="4" height="30" fill="#475569" />
-                <rect x="96" y="26" width="4" height="30" fill="#475569" />
-                <rect x="96" y="84" width="4" height="30" fill="#475569" />
+                <rect x="38" y="24" width="5" height="32" rx="1" fill="#334155" stroke="#475569" strokeWidth="0.8" />
+                <rect x="38" y="84" width="5" height="32" rx="1" fill="#334155" stroke="#475569" strokeWidth="0.8" />
+                <rect x="97" y="24" width="5" height="32" rx="1" fill="#334155" stroke="#475569" strokeWidth="0.8" />
+                <rect x="97" y="84" width="5" height="32" rx="1" fill="#334155" stroke="#475569" strokeWidth="0.8" />
+
                 {/* Spawn Wing Walls */}
-                <rect x="52" y="101" width="10" height="3" fill="#64748b" />
-                <rect x="78" y="101" width="10" height="3" fill="#64748b" />
-                <rect x="52" y="36" width="10" height="3" fill="#64748b" />
-                <rect x="78" y="36" width="10" height="3" fill="#64748b" />
-                {/* Central Radianite Obelisk */}
-                <rect x="65" y="65" width="10" height="10" fill="#0284c7" stroke="#38bdf8" strokeWidth="1" />
-                {/* Sector Callout Labels */}
-                <text x="14" y="73" fill="#f43f5e" fontSize="7" fontFamily="monospace" fontWeight="700">A</text>
-                <text x="120" y="73" fill="#10b981" fontSize="7" fontFamily="monospace" fontWeight="700">B</text>
+                <rect x="52" y="102" width="12" height="3" rx="0.5" fill="#475569" />
+                <rect x="76" y="102" width="12" height="3" rx="0.5" fill="#475569" />
+                <rect x="52" y="35" width="12" height="3" rx="0.5" fill="#475569" />
+                <rect x="76" y="35" width="12" height="3" rx="0.5" fill="#475569" />
+
+                {/* Central Radianite Obelisk Core */}
+                <rect x="64" y="64" width="12" height="12" rx="2" fill="#0284c7" stroke="#38bdf8" strokeWidth="1.2" />
+                <circle cx="70" cy="70" r="2" fill="#f8fafc" />
+
+                {/* Interactive Rope Swing Anchors & Kinetic Jump Pads on Minimap */}
+                {[
+                  [-4.6, 0],
+                  [4.6, 0],
+                  [0, 14.5],
+                  [0, -14.5],
+                  [-19.8, 0],
+                  [19.8, 0],
+                ].map(([rx, rz], idx) => {
+                  const pt = worldToMini(rx, rz);
+                  return (
+                    <circle
+                      key={`mini-rope-${idx}`}
+                      cx={pt.x}
+                      cy={pt.y}
+                      r="2.4"
+                      fill="none"
+                      stroke="#fbbf24"
+                      strokeWidth="1.1"
+                    />
+                  );
+                })}
+                {[
+                  [0, 12.2],
+                  [0, -12.2],
+                ].map(([jx, jz], idx) => {
+                  const pt = worldToMini(jx, jz);
+                  return (
+                    <rect
+                      key={`mini-pad-${idx}`}
+                      x={pt.x - 2}
+                      y={pt.y - 2}
+                      width="4"
+                      height="4"
+                      fill="#38bdf8"
+                    />
+                  );
+                })}
+
+                {/* Sector Callout Badges */}
+                <g transform="translate(12, 62)">
+                  <rect x="0" y="0" width="12" height="14" rx="1" fill="#1e101a" stroke="#f43f5e" strokeWidth="0.8" />
+                  <text x="3" y="10" fill="#f43f5e" fontSize="8" fontFamily="'Chakra Petch', sans-serif" fontWeight="700">A</text>
+                </g>
+                <g transform="translate(116, 62)">
+                  <rect x="0" y="0" width="12" height="14" rx="1" fill="#0a1f18" stroke="#10b981" strokeWidth="0.8" />
+                  <text x="3" y="10" fill="#10b981" fontSize="8" fontFamily="'Chakra Petch', sans-serif" fontWeight="700">B</text>
+                </g>
                 {/* AI / Rival Opponent Blip (shown when in LOS, Recon active, or Practice) */}
                 {hud.aiHealth > 0 && hud.aiVisibleOnRadar && (
                   <circle
@@ -264,11 +325,11 @@ export const GameHud: React.FC<GameHudProps> = ({
             </div>
           )}
 
-          {/* Practice Range Sandbox Quick Bar */}
+          {/* Practice Range Sandbox Quick Bar (Flush with Minimap Width) */}
           {hud.isPracticeMode && (
-            <div className="flex flex-wrap items-center gap-1.5 bg-[#090d16]/90 p-2 border border-cyan-500/40 pointer-events-auto max-w-[280px]">
-              <span className="w-full text-[10px] font-mono text-cyan-400 font-semibold uppercase">
-                Practice Sandbox Controls
+            <div className="grid grid-cols-2 gap-1 bg-[#090d16]/92 p-1.5 border border-slate-700/85 pointer-events-auto w-[158px] shadow-lg">
+              <span className="col-span-2 text-[9px] font-mono text-cyan-400 font-semibold uppercase tracking-wider px-0.5">
+                Sandbox Tools
               </span>
               <button
                 type="button"
@@ -277,9 +338,9 @@ export const GameHud: React.FC<GameHudProps> = ({
                   e.currentTarget.blur();
                   onPracticeAction('spawn_bot_mid');
                 }}
-                className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 cursor-pointer whitespace-nowrap"
+                className="py-1 px-1 text-[10px] font-sans font-medium bg-slate-800/90 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xs cursor-pointer truncate"
               >
-                Spawn Bot Mid
+                Spawn Bot
               </button>
               <button
                 type="button"
@@ -288,9 +349,9 @@ export const GameHud: React.FC<GameHudProps> = ({
                   e.currentTarget.blur();
                   onPracticeAction('refill_credits');
                 }}
-                className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700 cursor-pointer whitespace-nowrap"
+                className="py-1 px-1 text-[10px] font-mono font-semibold bg-slate-800/90 hover:bg-slate-700 text-emerald-300 border border-slate-700 rounded-xs cursor-pointer truncate"
               >
-                +9000 Credits
+                +9K Creds
               </button>
               <button
                 type="button"
@@ -300,9 +361,9 @@ export const GameHud: React.FC<GameHudProps> = ({
                   e.currentTarget.blur();
                   onPracticeAction('heal_player');
                 }}
-                className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 cursor-pointer whitespace-nowrap"
+                className="py-1 px-1 text-[10px] font-sans font-medium bg-slate-800/90 hover:bg-slate-700 text-cyan-300 border border-slate-700 rounded-xs cursor-pointer truncate"
               >
-                Heal + Shield
+                Full Heal
               </button>
               <button
                 type="button"
@@ -312,22 +373,22 @@ export const GameHud: React.FC<GameHudProps> = ({
                   e.currentTarget.blur();
                   onPracticeAction('sim_round_win');
                 }}
-                className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 cursor-pointer whitespace-nowrap"
+                className="py-1 px-1 text-[10px] font-sans font-medium bg-slate-800/90 hover:bg-slate-700 text-amber-300 border border-slate-700 rounded-xs cursor-pointer truncate"
               >
-                Sim Elimination
+                Sim Win
               </button>
             </div>
           )}
         </div>
 
-        {/* Top-Center: Round Score, Timer & Phase Banner */}
-        <div className="flex flex-col items-center gap-2">
+        {/* Top-Center: Unified Round Score, Timer & Phase Module */}
+        <div className="flex flex-col items-center">
           <div className="flex items-center bg-[#090d16]/94 border-t-2 border-t-rose-500 border-x border-b border-slate-700/90 shadow-2xl">
             {/* Player Score */}
             <div className="flex items-center gap-3 px-4 py-2 border-r border-slate-800">
               <div className="text-right">
                 <span className="block text-[10px] font-mono text-emerald-400 uppercase tracking-wider font-semibold">
-                  YOU // {op.id.toUpperCase()}
+                  YOU · {op.id.toUpperCase()}
                 </span>
                 <span className="block text-[11px] font-mono text-slate-400 tabular-nums">
                   {hud.playerHealth} HP
@@ -388,7 +449,7 @@ export const GameHud: React.FC<GameHudProps> = ({
           {hud.isMultiplayer && (
             <div
               data-testid="hud-multiplayer-banner"
-              className="flex items-center gap-3 bg-[#091326]/94 border border-cyan-500/60 px-3.5 py-1 text-[11px] font-mono tracking-wider text-cyan-200 shadow-md"
+              className="w-full flex items-center justify-center gap-3 bg-[#091326]/95 border-x border-b border-cyan-500/60 px-3.5 py-1 text-[11px] font-mono tracking-wider text-cyan-200 shadow-md"
             >
               <span>
                 ROOM CODE: <strong className="text-white select-all">{hud.multiplayerRoomCode}</strong>
@@ -402,10 +463,10 @@ export const GameHud: React.FC<GameHudProps> = ({
             </div>
           )}
 
-          {/* Round Phase / Announcement Strip */}
+          {/* Round Phase / Announcement Strip Integrated Flush Below Scoreboard */}
           {hud.roundAnnouncement && (
-            <div className="flex items-center gap-3 bg-[#090d16]/92 border border-slate-700 px-4 py-1.5 text-xs font-mono tracking-wider text-slate-100 pointer-events-auto shadow-lg">
-              <span>{hud.roundAnnouncement}</span>
+            <div className="w-full flex items-center justify-center gap-3 bg-[#070b14]/94 border-x border-b border-slate-700/90 px-4 py-1 text-[11px] font-mono tracking-wider text-slate-200 pointer-events-auto shadow-lg">
+              <span>{hud.roundAnnouncement.replace('//', '·')}</span>
               {hud.roundPhase === 'buy' && (
                 <button
                   type="button"
@@ -414,7 +475,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                     e.currentTarget.blur();
                     onDeployNow();
                   }}
-                  className="px-2.5 py-0.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold uppercase text-[11px] cursor-pointer whitespace-nowrap"
+                  className="px-2.5 py-0.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold uppercase text-[10px] rounded-xs cursor-pointer whitespace-nowrap"
                 >
                   Start Combat Now
                 </button>
@@ -467,11 +528,83 @@ export const GameHud: React.FC<GameHudProps> = ({
               {hud.nearbyObjective.actionHint}
             </button>
           )}
+
+          {/* Interactive Rope Swing & Wall Jump Prompts */}
+          {(hud.isSwinging || hud.nearbyRopeAnchor) && (
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="hud-rope-swing-prompt"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onTriggerRopeSwing?.();
+              }}
+              className={`mt-1 px-3.5 py-1 border font-mono text-[11px] font-semibold tracking-wider pointer-events-auto cursor-pointer transition-colors ${
+                hud.isSwinging
+                  ? 'bg-amber-950/95 border-amber-400 text-amber-200'
+                  : 'bg-[#090d16]/90 border-amber-500/70 text-amber-300 hover:bg-amber-950/80'
+              }`}
+            >
+              {hud.isSwinging
+                ? '[SPACE / Q] VAULT OFF ROPE · GUN ACTIVE'
+                : `[Q] GRAPPLE & SWING ROPE · ${hud.nearbyRopeAnchor?.label}`}
+            </button>
+          )}
+
+          {(hud.isWallRunning || hud.canWallJump) && !hud.isSwinging && (
+            <div
+              data-testid="hud-wall-run-prompt"
+              className="mt-1 px-3.5 py-1 bg-cyan-950/92 border border-cyan-400/80 text-cyan-200 font-mono text-[11px] font-semibold tracking-wider"
+            >
+              {hud.isWallRunning
+                ? `WALL RUN (${hud.wallRunSide?.toUpperCase()}) · [SPACE] WALL JUMP · GUN ACTIVE`
+                : '[SPACE] WALL JUMP AVAILABLE'}
+            </div>
+          )}
         </div>
 
         {/* Top-Right: Compact Utility Icon Controls + Kill Feed */}
         <div className="flex flex-col items-end gap-2">
           <div className="flex items-center gap-1.5 pointer-events-auto">
+            {showFps && (
+              <div
+                data-testid="hud-fps-counter"
+                title="Real-time Framerate & Frame Duration"
+                className="flex items-center gap-2 bg-[#090d16]/92 border border-slate-700/80 px-2.5 h-9 text-xs font-mono shadow-md backdrop-blur-xs select-none"
+              >
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      (hud.fps ?? 60) >= 55
+                        ? 'bg-emerald-400 animate-pulse'
+                        : (hud.fps ?? 60) >= 30
+                        ? 'bg-amber-400'
+                        : 'bg-rose-500'
+                    }`}
+                  />
+                  <span
+                    data-testid="hud-fps-value"
+                    className={`font-bold tabular-nums text-sm ${
+                      (hud.fps ?? 60) >= 55
+                        ? 'text-emerald-300'
+                        : (hud.fps ?? 60) >= 30
+                        ? 'text-amber-300'
+                        : 'text-rose-400'
+                    }`}
+                  >
+                    {hud.fps ?? 60}
+                  </span>
+                  <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
+                    FPS
+                  </span>
+                </div>
+                <span className="text-slate-600">|</span>
+                <span className="text-[11px] text-slate-400 tabular-nums">
+                  {(hud.frameTimeMs ?? 16.6).toFixed(1)}ms
+                </span>
+              </div>
+            )}
+
             <button
               type="button"
               tabIndex={-1}
@@ -652,9 +785,11 @@ export const GameHud: React.FC<GameHudProps> = ({
               <span
                 data-testid="hud-player-stance"
                 className={`text-[9px] font-mono px-1.5 py-0.2 border ${
-                  hud.isSliding
-                    ? 'bg-cyan-950 text-cyan-200 border-cyan-400 font-bold'
-                    : 'bg-slate-800 text-cyan-300 border-slate-700'
+                  hud.isSwinging
+                    ? 'bg-amber-950 text-amber-200 border-amber-400 font-bold'
+                    : hud.isWallRunning || hud.isSliding
+                      ? 'bg-cyan-950 text-cyan-200 border-cyan-400 font-bold'
+                      : 'bg-slate-800 text-cyan-300 border-slate-700'
                 }`}
               >
                 {stanceLabel}
@@ -712,8 +847,8 @@ export const GameHud: React.FC<GameHudProps> = ({
 
         {/* Bottom-Right: Equipped Weapon, Magazine/Reserve & Slot Switcher */}
         <div className="flex flex-col items-end gap-2">
-          {/* Owned Weapon Slots Strip + Inspect Trigger */}
-          <div className="flex items-center gap-1.5 pointer-events-auto">
+          {/* Compact Weapon Slots Strip (Aligned strictly to right-hand ammo card width) */}
+          <div className="flex items-center justify-end gap-1.5 pointer-events-auto">
             {WEAPON_ORDER.map((wid) => {
               const spec = WEAPONS[wid];
               const inst = hud.ownedWeapons[wid];
@@ -724,19 +859,24 @@ export const GameHud: React.FC<GameHudProps> = ({
                   type="button"
                   tabIndex={-1}
                   disabled={!inst}
+                  title={`[${spec.slot}] ${spec.name}`}
+                  aria-label={`[${spec.slot}] ${spec.name}`}
                   onClick={(e) => {
                     e.currentTarget.blur();
                     if (inst) onEquipWeapon(wid);
                   }}
-                  className={`px-2.5 py-1 text-xs font-mono border transition-colors ${
+                  className={`py-1 text-xs font-mono border rounded-xs transition-colors flex items-center gap-1 ${
                     isEquipped
-                      ? 'bg-rose-600/90 border-rose-400 text-white font-bold cursor-pointer hud-panel-glow-rose'
+                      ? 'px-2.5 bg-rose-600/95 border-rose-400 text-white font-bold cursor-pointer hud-panel-glow-rose shadow-md'
                       : inst
-                        ? 'bg-[#090d16]/90 border-slate-700 text-slate-200 hover:border-slate-500 cursor-pointer'
-                        : 'bg-[#090d16]/50 border-slate-800/60 text-slate-600 cursor-not-allowed'
+                        ? 'px-2.5 bg-[#090d16]/92 border-slate-700 text-slate-200 hover:border-slate-500 hover:text-white cursor-pointer'
+                        : 'px-2 bg-[#060a14]/75 border-slate-800/80 text-slate-400 cursor-not-allowed'
                   }`}
                 >
-                  [{spec.slot}] {spec.name}
+                  <span className={isEquipped ? 'text-white' : inst ? 'text-cyan-300 font-bold' : 'text-slate-400'}>
+                    [{spec.slot}]
+                  </span>
+                  {inst && <span>{spec.name}</span>}
                 </button>
               );
             })}
@@ -747,7 +887,7 @@ export const GameHud: React.FC<GameHudProps> = ({
             <div className="flex flex-col items-end">
               <div className="flex items-center gap-2">
                 <span className="text-[10px] font-mono text-cyan-400 uppercase tracking-wider">
-                  [Y] INSPECT
+                  [SCROLL] SWITCH · [Y] INSPECT
                 </span>
                 <span className="text-[10px] font-mono text-slate-300 font-semibold uppercase tracking-widest">
                   {activeWeaponSpec.codeName}

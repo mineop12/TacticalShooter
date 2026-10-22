@@ -4,11 +4,13 @@ import {
   AIDifficulty,
   ArmorType,
   KillFeedEntry,
+  RopeAnchor,
+  WallContact,
   Waypoint,
   WeaponId,
   WeaponInstanceState,
 } from './types.ts';
-import { AI_DIFFICULTY_CONFIGS, ARMOR_SPECS, WEAPONS } from './weapons.ts';
+import { AI_DIFFICULTY_CONFIGS, ARMOR_SPECS, WEAPON_ORDER, WEAPONS } from './weapons.ts';
 
 export const MAX_CREDITS = 9000;
 export const STARTING_CREDITS = 800;
@@ -133,6 +135,25 @@ export function canPurchaseWeapon(
   }
 
   return { allowed: true, cost: spec.cost };
+}
+
+/**
+ * Cycles to the next or previous owned weapon in inventory based on scroll wheel direction.
+ */
+export function cycleWeaponSelection(
+  ownedWeapons: Partial<Record<WeaponId, unknown>>,
+  currentWeaponId: WeaponId,
+  direction: 'next' | 'prev'
+): WeaponId {
+  const ownedList = WEAPON_ORDER.filter((wid) => Boolean(ownedWeapons[wid]));
+  if (ownedList.length === 0) return currentWeaponId;
+  const currentIndex = ownedList.indexOf(currentWeaponId);
+  if (currentIndex === -1) return ownedList[0];
+  if (direction === 'next') {
+    return ownedList[(currentIndex + 1) % ownedList.length];
+  } else {
+    return ownedList[(currentIndex - 1 + ownedList.length) % ownedList.length];
+  }
 }
 
 /**
@@ -1053,6 +1074,421 @@ export function resolveKillFeedWeaponId(
   }
   return 'rifle';
 }
+
+/**
+ * Finds the highest walkable support surface (0 for ground floor, or b.maxY for crates/platforms)
+ * under the player's cylinder.
+ */
+export function findSupportFloorHeight(
+  x: number,
+  z: number,
+  prevY: number,
+  currentY: number,
+  radius: number,
+  boxes: AABB[]
+): number {
+  let highestFloor = 0;
+  const pad = radius * 0.45;
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i];
+    if (
+      x >= b.minX - pad &&
+      x <= b.maxX + pad &&
+      z >= b.minZ - pad &&
+      z <= b.maxZ + pad
+    ) {
+      if (prevY >= b.maxY - 0.42 && currentY <= b.maxY + 0.12) {
+        if (b.maxY > highestFloor) {
+          highestFloor = b.maxY;
+        }
+      }
+    }
+  }
+  return highestFloor;
+}
+
+/**
+ * Detects the nearest vertical wall or kinetic wall-run panel within `maxDetectDist`
+ * when the player is airborne or initiating a wall-run / wall-jump.
+ */
+export function detectRunnableWall(
+  x: number,
+  y: number,
+  z: number,
+  vx: number,
+  vz: number,
+  yaw: number,
+  boxes: AABB[],
+  maxDetectDist = 0.96
+): WallContact | null {
+  let best: WallContact | null = null;
+  let bestDist = maxDetectDist;
+
+  const fwdX = -Math.sin(yaw);
+  const fwdZ = -Math.cos(yaw);
+  const rightX = Math.cos(yaw);
+  const rightZ = -Math.sin(yaw);
+
+  const speed = Math.hypot(vx, vz);
+  const moveDirX = speed > 1.2 ? vx / speed : fwdX;
+  const moveDirZ = speed > 1.2 ? vz / speed : fwdZ;
+
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i];
+    const wallHeight = b.maxY - b.minY;
+    if (wallHeight < 2.1) continue;
+    if (y + 1.35 < b.minY || y + 0.25 > b.maxY) continue;
+
+    const closestX = Math.max(b.minX, Math.min(x, b.maxX));
+    const closestZ = Math.max(b.minZ, Math.min(z, b.maxZ));
+    const dx = x - closestX;
+    const dz = z - closestZ;
+    const dist = Math.hypot(dx, dz);
+
+    if (dist > 0.001 && dist < bestDist) {
+      const nx = dx / dist;
+      const nz = dz / dist;
+
+      let tx = -nz;
+      let tz = nx;
+      if (tx * moveDirX + tz * moveDirZ < 0) {
+        tx = nz;
+        tz = -nx;
+      }
+
+      const dotRight = -nx * rightX + -nz * rightZ;
+      const side: 'left' | 'right' = dotRight >= 0 ? 'right' : 'left';
+
+      bestDist = dist;
+      best = {
+        wallId: b.id,
+        normalX: nx,
+        normalZ: nz,
+        tangentX: tx,
+        tangentZ: tz,
+        side,
+        distance: dist,
+        isWallRunPanel: Boolean(b.isWallRunPanel),
+      };
+    }
+  }
+
+  return best;
+}
+
+/**
+ * Computes velocity and camera tilt during an active wall-run step.
+ */
+export function computeWallRunStep(
+  vx: number,
+  vy: number,
+  vz: number,
+  wall: WallContact,
+  wallRunTimer: number,
+  dt: number
+): { vx: number; vy: number; vz: number; targetRoll: number; shouldDetach: boolean } {
+  const runSpeed = Math.max(Math.hypot(vx, vz), wall.isWallRunPanel ? 9.4 : 8.3);
+  const distError = wall.distance - 0.52;
+  const pullSpeed = Math.max(-2.5, Math.min(2.5, distError * 6.0));
+
+  const nextVx = wall.tangentX * runSpeed - wall.normalX * pullSpeed;
+  const nextVz = wall.tangentZ * runSpeed - wall.normalZ * pullSpeed;
+
+  const nextVy = wallRunTimer < 0.42 ? Math.max(vy, 1.35) : Math.max(-0.85, vy - 2.4 * dt);
+  const targetRoll = wall.side === 'left' ? 0.19 : -0.19;
+  const shouldDetach = wallRunTimer > 1.85;
+
+  return { vx: nextVx, vy: nextVy, vz: nextVz, targetRoll, shouldDetach };
+}
+
+/**
+ * Computes the 3D launch velocity impulse when wall-jumping off a surface.
+ */
+export function computeWallJumpImpulse(
+  vx: number,
+  vz: number,
+  yaw: number,
+  wall: WallContact
+): { vx: number; vy: number; vz: number } {
+  const fwdX = -Math.sin(yaw);
+  const fwdZ = -Math.cos(yaw);
+
+  let rawVx = wall.normalX * 5.8 + fwdX * 5.6 + vx * 0.35;
+  let rawVz = wall.normalZ * 5.8 + fwdZ * 5.6 + vz * 0.35;
+
+  const horizSpeed = Math.hypot(rawVx, rawVz);
+  const maxJumpHoriz = 10.2;
+  if (horizSpeed > maxJumpHoriz) {
+    rawVx = (rawVx / horizSpeed) * maxJumpHoriz;
+    rawVz = (rawVz / horizSpeed) * maxJumpHoriz;
+  }
+
+  return {
+    vx: rawVx,
+    vy: 8.4,
+    vz: rawVz,
+  };
+}
+
+/**
+ * Finds the best overhead rope anchor within grapple/swing range.
+ */
+export function findBestRopeAnchor(
+  playerX: number,
+  playerY: number,
+  playerZ: number,
+  yaw: number,
+  pitch: number,
+  anchors: RopeAnchor[]
+): RopeAnchor | null {
+  const lookX = -Math.sin(yaw) * Math.cos(pitch);
+  const lookY = Math.sin(pitch);
+  const lookZ = -Math.cos(yaw) * Math.cos(pitch);
+
+  let bestAnchor: RopeAnchor | null = null;
+  let bestScore = -Infinity;
+
+  for (let i = 0; i < anchors.length; i++) {
+    const a = anchors[i];
+    const dx = a.x - playerX;
+    const dy = a.y - (playerY + 1.5);
+    const dz = a.z - playerZ;
+    const dist3D = Math.hypot(dx, dy, dz);
+    const horizDist = Math.hypot(dx, dz);
+
+    if (dist3D > a.grabRadius || a.y <= playerY + 1.0) continue;
+
+    const dirX = dx / Math.max(0.001, dist3D);
+    const dirY = dy / Math.max(0.001, dist3D);
+    const dirZ = dz / Math.max(0.001, dist3D);
+    const dotLook = dirX * lookX + dirY * lookY + dirZ * lookZ;
+
+    if (dotLook > 0.22 || horizDist < 5.2) {
+      const score = dotLook * 10 - dist3D * 0.45 + (horizDist < 4.5 ? 4.0 : 0);
+      if (score > bestScore) {
+        bestScore = score;
+        bestAnchor = a;
+      }
+    }
+  }
+
+  return bestAnchor;
+}
+
+/**
+ * Integrates one step of 3D pendulum rope-swing physics while allowing directional air control.
+ */
+export function computeRopeSwingStep(
+  playerX: number,
+  playerY: number,
+  playerZ: number,
+  vx: number,
+  vy: number,
+  vz: number,
+  wishDirX: number,
+  wishDirZ: number,
+  anchor: RopeAnchor,
+  ropeLength: number,
+  dt: number
+): {
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  cameraRoll: number;
+} {
+  let nextVx = vx + wishDirX * 14.5 * dt;
+  let nextVy = vy - 18.0 * dt;
+  let nextVz = vz + wishDirZ * 14.5 * dt;
+
+  let nx = playerX + nextVx * dt;
+  let ny = playerY + nextVy * dt;
+  let nz = playerZ + nextVz * dt;
+
+  const rx = nx - anchor.x;
+  const ry = ny + 1.2 - anchor.y;
+  const rz = nz - anchor.z;
+  const dist = Math.hypot(rx, ry, rz);
+
+  if (dist > ropeLength && dist > 0.001) {
+    const ux = rx / dist;
+    const uy = ry / dist;
+    const uz = rz / dist;
+
+    nx = anchor.x + ux * ropeLength;
+    ny = anchor.y + uy * ropeLength - 1.2;
+    nz = anchor.z + uz * ropeLength;
+
+    const radialVel = nextVx * ux + nextVy * uy + nextVz * uz;
+    if (radialVel > 0) {
+      nextVx -= radialVel * ux;
+      nextVy -= radialVel * uy;
+      nextVz -= radialVel * uz;
+    }
+
+    nextVx *= 1.004;
+    nextVz *= 1.004;
+  }
+
+  const speed = Math.hypot(nextVx, nextVy, nextVz);
+  if (speed > 13.5) {
+    const scale = 13.5 / speed;
+    nextVx *= scale;
+    nextVy *= scale;
+    nextVz *= scale;
+  }
+
+  if (ny < 0.25) {
+    ny = 0.25;
+    if (nextVy < 0) nextVy = 0;
+  }
+
+  const cameraRoll = Math.max(-0.14, Math.min(0.14, (rx * nextVz - rz * nextVx) * 0.0025));
+
+  return {
+    x: nx,
+    y: ny,
+    z: nz,
+    vx: nextVx,
+    vy: nextVy,
+    vz: nextVz,
+    cameraRoll,
+  };
+}
+
+export interface SubtleAimAssistResult {
+  engaged: boolean;
+  nextYaw: number;
+  nextPitch: number;
+  sensitivityScale: number;
+  magnetDirX: number;
+  magnetDirY: number;
+  magnetDirZ: number;
+  magnetStrength: number;
+}
+
+/**
+ * Computes a gentle, non-intrusive tactical aim assist when the player's crosshair
+ * is within a narrow cone (~4.5° standard, ~5.8° during ADS / wall-run / rope-swing)
+ * of a visible opponent.
+ * - Preserves head vs. chest aim preference (locks onto whichever is closer to current pitch).
+ * - Applies a soft rotational tracking nudge, slight mouse friction slowdown (~18% max),
+ *   and a subtle 28% bullet magnetism blend only inside the inner ~2.2° cone.
+ */
+export function computeSubtleAimAssist(
+  eyeX: number,
+  eyeY: number,
+  eyeZ: number,
+  playerYaw: number,
+  playerPitch: number,
+  targetX: number,
+  targetBaseY: number,
+  targetZ: number,
+  dt: number,
+  isHighMobilityOrAds = false
+): SubtleAimAssistResult {
+  const dx = targetX - eyeX;
+  const dz = targetZ - eyeZ;
+  const horizDist = Math.hypot(dx, dz);
+
+  const curDirX = -Math.sin(playerYaw) * Math.cos(playerPitch);
+  const curDirY = Math.sin(playerPitch);
+  const curDirZ = -Math.cos(playerYaw) * Math.cos(playerPitch);
+
+  if (horizDist < 0.6 || horizDist > 48.0) {
+    return {
+      engaged: false,
+      nextYaw: playerYaw,
+      nextPitch: playerPitch,
+      sensitivityScale: 1.0,
+      magnetDirX: curDirX,
+      magnetDirY: curDirY,
+      magnetDirZ: curDirZ,
+      magnetStrength: 0,
+    };
+  }
+
+  // Ideal yaw to opponent center
+  const idealYaw = Math.atan2(-dx, -dz);
+  let yawDiff = idealYaw - playerYaw;
+  while (yawDiff > Math.PI) yawDiff -= Math.PI * 2;
+  while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
+
+  // Pick head (baseY + 1.62) or upper chest (baseY + 1.32) based on whichever is closer to current pitch
+  const headY = targetBaseY + 1.62;
+  const chestY = targetBaseY + 1.32;
+  const pitchToHead = Math.atan2(headY - eyeY, horizDist);
+  const pitchToChest = Math.atan2(chestY - eyeY, horizDist);
+  const aimPointY =
+    Math.abs(pitchToHead - playerPitch) <= Math.abs(pitchToChest - playerPitch) + 0.012
+      ? headY
+      : chestY;
+
+  const idealPitch = Math.atan2(aimPointY - eyeY, horizDist);
+  const pitchDiff = idealPitch - playerPitch;
+
+  const angularError = Math.hypot(yawDiff, pitchDiff);
+  const maxConeRad = isHighMobilityOrAds ? 0.101 : 0.078; // ~5.8° or ~4.5°
+
+  if (angularError >= maxConeRad) {
+    return {
+      engaged: false,
+      nextYaw: playerYaw,
+      nextPitch: playerPitch,
+      sensitivityScale: 1.0,
+      magnetDirX: curDirX,
+      magnetDirY: curDirY,
+      magnetDirZ: curDirZ,
+      magnetStrength: 0,
+    };
+  }
+
+  // Normalized distance inside cone [0 = dead center, 1 = outer edge]
+  const norm = angularError / maxConeRad;
+  // Smooth bell weight so it never fights micro-aim at 0.0 or snaps at 1.0
+  const bellWeight = (1 - norm) * (0.35 + 0.65 * norm);
+  const pullStrength = (isHighMobilityOrAds ? 2.15 : 1.45) * bellWeight;
+  const stepFactor = Math.min(0.28, pullStrength * Math.max(0, Math.min(0.05, dt)));
+
+  const nextYaw = playerYaw + yawDiff * stepFactor;
+  const nextPitch = Math.max(
+    -Math.PI / 2.2,
+    Math.min(Math.PI / 2.2, playerPitch + pitchDiff * stepFactor)
+  );
+
+  // Subtle rotational friction slowdown (down to 0.82x at center of target)
+  const sensitivityScale = 1.0 - 0.18 * (1 - norm);
+
+  // Subtle bullet magnetism only within the inner 55% of the assist cone
+  const dy = aimPointY - eyeY;
+  const dist3D = Math.max(0.001, Math.hypot(dx, dy, dz));
+  const toTargetX = dx / dist3D;
+  const toTargetY = dy / dist3D;
+  const toTargetZ = dz / dist3D;
+
+  const magnetStrength = norm < 0.58 ? (1 - norm / 0.58) * (isHighMobilityOrAds ? 0.34 : 0.26) : 0;
+  let magX = curDirX * (1 - magnetStrength) + toTargetX * magnetStrength;
+  let magY = curDirY * (1 - magnetStrength) + toTargetY * magnetStrength;
+  let magZ = curDirZ * (1 - magnetStrength) + toTargetZ * magnetStrength;
+  const magLen = Math.max(0.001, Math.hypot(magX, magY, magZ));
+  magX /= magLen;
+  magY /= magLen;
+  magZ /= magLen;
+
+  return {
+    engaged: true,
+    nextYaw,
+    nextPitch,
+    sensitivityScale,
+    magnetDirX: magX,
+    magnetDirY: magY,
+    magnetDirZ: magZ,
+    magnetStrength,
+  };
+}
+
 
 
 

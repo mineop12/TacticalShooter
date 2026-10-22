@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { AABB, InteractiveObjective, Waypoint } from './types';
+import { AABB, InteractiveObjective, JumpPad, RopeAnchor, Waypoint } from './types';
 import { TacticalMaterialLibrary } from './textures';
 
 export interface TacticalArenaResult {
@@ -7,6 +7,8 @@ export interface TacticalArenaResult {
   obstacles: AABB[];
   waypoints: Waypoint[];
   objectives: InteractiveObjective[];
+  ropeAnchors: RopeAnchor[];
+  jumpPads: JumpPad[];
   obeliskCore: THREE.Mesh;
   beaconRings: THREE.Mesh[];
   playerSpawn: { x: number; y: number; z: number; yaw: number };
@@ -19,6 +21,7 @@ export interface TacticalArenaResult {
  * - Grounded Architectural Portal Arches (zero floating beams) with support columns & gussets
  * - Perimeter Fortress Walls with vertical buttress pillars, parapet caps, and floodlight stanchions
  * - Central Radianite Reactor Plaza with octagonal containment pad & rotating energy core
+ * - Interactive Wall-Run Kinetic Billboards, Overhead Swinging Rope Anchors, Elevated Platforms & Jump Pads
  * - Distinct West Long ("SECTOR A // LONG") and East Chicane ("SECTOR B // LINK") combat lanes
  * - Clearance-verified 20-node AI Navigation Graph so the AI never clips corners
  */
@@ -26,6 +29,8 @@ export function buildTacticalArena(mats: TacticalMaterialLibrary): TacticalArena
   const arenaGroup = new THREE.Group();
   const obstacles: AABB[] = [];
   const beaconRings: THREE.Mesh[] = [];
+  const ropeAnchors: RopeAnchor[] = [];
+  const jumpPads: JumpPad[] = [];
 
   // Controlled accent emissive materials (calibrated below bloom blowout)
   const crimsonStripMat = new THREE.MeshBasicMaterial({ color: 0xe11d48 });
@@ -205,52 +210,91 @@ export function buildTacticalArena(mats: TacticalMaterialLibrary): TacticalArena
   const obeliskGroup = new THREE.Group();
   obeliskGroup.position.set(0, 0, 0);
 
-  // Octagonal grounded containment pad
+  // Octagonal grounded containment pad + recessed plasma moat ring
   const padMesh = new THREE.Mesh(
-    new THREE.CylinderGeometry(3.4, 3.7, 0.14, 8),
+    new THREE.CylinderGeometry(3.5, 3.8, 0.14, 8),
     mats.darkHullMat
   );
   padMesh.position.y = 0.07;
   const padRing = new THREE.Mesh(
-    new THREE.CylinderGeometry(3.1, 3.1, 0.16, 8),
+    new THREE.CylinderGeometry(3.15, 3.15, 0.17, 8),
     mats.trimMetalMat
   );
-  padRing.position.y = 0.08;
-  obeliskGroup.add(padMesh, padRing);
+  padRing.position.y = 0.085;
+  const padGlowRing = new THREE.Mesh(
+    new THREE.TorusGeometry(2.85, 0.06, 8, 24),
+    cyanStripMat
+  );
+  padGlowRing.rotation.x = Math.PI / 2;
+  padGlowRing.position.y = 0.17;
+  obeliskGroup.add(padMesh, padRing, padGlowRing);
 
   const pedBase = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.55, 2.8), mats.darkHullMat);
   pedBase.position.y = 0.28;
   const pedStep = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.35, 2.4), mats.trimMetalMat);
   pedStep.position.y = 0.72;
-  const pedMid = new THREE.Mesh(new THREE.BoxGeometry(2.0, 2.1, 2.0), mats.radianiteCrateMat);
+  const pedMid = new THREE.Mesh(new THREE.BoxGeometry(1.95, 2.15, 1.95), mats.radianiteCrateMat);
   pedMid.position.y = 1.95;
   pedMid.castShadow = true;
 
-  // 4 Corner containment pylons around the Obelisk base
-  [
-    [-1.12, -1.12],
-    [1.12, -1.12],
-    [-1.12, 1.12],
-    [1.12, 1.12],
-  ].forEach(([px, pz]) => {
-    const pylon = new THREE.Mesh(new THREE.BoxGeometry(0.26, 3.2, 0.26), mats.darkHullMat);
-    pylon.position.set(px, 1.6, pz);
-    obeliskGroup.add(pylon);
-  });
-
-  const obeliskCore = new THREE.Mesh(new THREE.OctahedronGeometry(1.1, 0), mats.obeliskCoreMat);
-  obeliskCore.position.y = 4.3;
-
-  // Dual containment stabilizer rings around the floating core
-  const cageRing = new THREE.Mesh(
-    new THREE.TorusGeometry(1.55, 0.06, 8, 24),
+  // Lathe-Contoured Reactor Containment Turbine Collar around the central core pedestal
+  const turbineProfile = [
+    new THREE.Vector2(1.38, 0.85),
+    new THREE.Vector2(1.18, 1.15),
+    new THREE.Vector2(1.28, 1.45),
+    new THREE.Vector2(1.06, 2.15),
+    new THREE.Vector2(1.25, 2.75),
+    new THREE.Vector2(0.88, 3.15),
+  ];
+  const turbineCollar = new THREE.Mesh(
+    new THREE.LatheGeometry(turbineProfile, 8),
     mats.trimMetalMat
   );
-  cageRing.position.y = 4.3;
+  obeliskGroup.add(turbineCollar);
+
+  // 4 Corner containment pylons + angled stabilizer fins + glowing plasma veins
+  [
+    [-1.16, -1.16],
+    [1.16, -1.16],
+    [-1.16, 1.16],
+    [1.16, 1.16],
+  ].forEach(([px, pz]) => {
+    const pylon = new THREE.Mesh(new THREE.BoxGeometry(0.28, 3.4, 0.28), mats.darkHullMat);
+    pylon.position.set(px, 1.7, pz);
+    const pylonCap = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.45, 4), mats.trimMetalMat);
+    pylonCap.position.set(px, 3.62, pz);
+    pylonCap.rotation.y = Math.PI / 4;
+    const pylonVein = new THREE.Mesh(new THREE.BoxGeometry(0.31, 2.4, 0.08), cyanStripMat);
+    pylonVein.position.set(px, 1.75, pz);
+    obeliskGroup.add(pylon, pylonCap, pylonVein);
+  });
+
+  const obeliskCore = new THREE.Mesh(new THREE.OctahedronGeometry(1.12, 1), mats.obeliskCoreMat);
+  obeliskCore.position.y = 4.35;
+
+  // Dual orthogonal containment stabilizer rings around the floating core
+  const cageRing = new THREE.Mesh(
+    new THREE.TorusGeometry(1.58, 0.065, 10, 28),
+    mats.trimMetalMat
+  );
+  cageRing.position.y = 4.35;
   cageRing.rotation.x = Math.PI / 4;
 
-  const upperSpire = new THREE.Mesh(new THREE.ConeGeometry(0.9, 2.6, 4), mats.trimMetalMat);
+  const cageRingInner = new THREE.Mesh(
+    new THREE.TorusGeometry(1.36, 0.045, 8, 24),
+    cyanStripMat
+  );
+  cageRingInner.position.y = 4.35;
+  cageRingInner.rotation.y = Math.PI / 4;
+  cageRingInner.rotation.x = -Math.PI / 6;
+
+  const upperSpire = new THREE.Mesh(new THREE.ConeGeometry(0.92, 2.6, 4), mats.trimMetalMat);
   upperSpire.position.y = 6.5;
+  const upperSpireCollar = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.05, 0.65, 0.35, 8),
+    mats.darkHullMat
+  );
+  upperSpireCollar.position.y = 5.35;
 
   // Grounded Overhead Architectural Skybridge spanning Mid Courtyard
   const archLeft = new THREE.Mesh(new THREE.BoxGeometry(1.3, 7.8, 1.4), mats.accentWallMat);
@@ -278,7 +322,9 @@ export function buildTacticalArena(mats: TacticalMaterialLibrary): TacticalArena
     pedMid,
     obeliskCore,
     cageRing,
+    cageRingInner,
     upperSpire,
+    upperSpireCollar,
     archLeft,
     archLeftBase,
     archRight,
@@ -425,7 +471,7 @@ export function buildTacticalArena(mats: TacticalMaterialLibrary): TacticalArena
   addBlock('east_flank_crate_s', 21.5, 8.5, 1.9, 1.8, 1.9, mats.crateMat, true, 'crate');
   addBlock('east_flank_crate_n', 21.5, -8.5, 1.9, 1.8, 1.9, mats.crateMat, true, 'crate');
 
-  // 9. Interactive Tactical Objectives (Press [E] to interact)
+  // 9. Interactive Tactical Objectives (Press [E] to interact) — High-Detail 9-Part Terminals
   const objectives: InteractiveObjective[] = [
     {
       id: 'obj_south_ammo',
@@ -454,25 +500,92 @@ export function buildTacticalArena(mats: TacticalMaterialLibrary): TacticalArena
   objectives.forEach((obj) => {
     const objGroup = new THREE.Group();
     objGroup.position.set(obj.x, 0, obj.z);
+    const isRadar = obj.type === 'radar_beacon';
 
-    const basePed = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.16, 0.9), mats.darkHullMat);
+    // Stepped octagonal foundation pad + protective corner bollards
+    const basePed = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.72, 0.84, 0.16, 8),
+      mats.darkHullMat
+    );
     basePed.position.y = 0.08;
+    objGroup.add(basePed);
+
+    [
+      [-0.54, -0.44],
+      [0.54, -0.44],
+      [-0.54, 0.44],
+      [0.54, 0.44],
+    ].forEach(([bx, bz]) => {
+      const bollard = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.055, 0.065, 0.62, 8),
+        mats.trimMetalMat
+      );
+      bollard.position.set(bx, 0.31, bz);
+      objGroup.add(bollard);
+    });
+
+    // Main armored kiosk cabinet + angled holographic console hood
     const kiosk = new THREE.Mesh(
-      new THREE.BoxGeometry(0.88, 1.05, 0.68),
-      obj.type === 'radar_beacon' ? mats.obeliskCoreMat : mats.radianiteCrateMat
+      new THREE.BoxGeometry(0.86, 1.02, 0.64),
+      isRadar ? mats.accentWallMat : mats.radianiteCrateMat
     );
     kiosk.position.y = 0.62;
-    const antenna = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.04, 0.04, 0.65, 8),
-      mats.trimMetalMat
-    );
-    antenna.position.set(0.28, 1.4, 0);
-    objGroup.add(basePed, kiosk, antenna);
+    kiosk.castShadow = true;
 
-    const ringGeo = new THREE.RingGeometry(1.1, 1.3, 28);
+    const consoleScreen = new THREE.Mesh(
+      new THREE.BoxGeometry(0.68, 0.36, 0.08),
+      isRadar ? cyanStripMat : emeraldStripMat
+    );
+    consoleScreen.position.set(0, 0.88, 0.32);
+    consoleScreen.rotation.x = -0.35;
+    objGroup.add(kiosk, consoleScreen);
+
+    if (isRadar) {
+      // Parabolic Recon Radar Dish + Twin Telemetry Antennas
+      const dishMast = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.06, 0.08, 0.55, 10),
+        mats.trimMetalMat
+      );
+      dishMast.position.set(0, 1.38, -0.08);
+      const dishBowl = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.42, 0.12, 0.18, 16),
+        mats.trimMetalMat
+      );
+      dishBowl.position.set(0, 1.68, -0.04);
+      dishBowl.rotation.x = 0.55;
+      const dishFeed = new THREE.Mesh(
+        new THREE.SphereGeometry(0.075, 10, 10),
+        mats.obeliskCoreMat
+      );
+      dishFeed.position.set(0, 1.78, 0.08);
+      objGroup.add(dishMast, dishBowl, dishFeed);
+    } else {
+      // Twin Side Shield-Cell Canisters + Upper Munitions Rack
+      [-0.5, 0.5].forEach((cx) => {
+        const canister = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.11, 0.11, 0.78, 12),
+          mats.obeliskCoreMat
+        );
+        canister.position.set(cx, 0.62, 0);
+        const canisterCap = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.125, 0.125, 0.1, 12),
+          mats.trimMetalMat
+        );
+        canisterCap.position.set(cx, 1.02, 0);
+        objGroup.add(canister, canisterCap);
+      });
+      const topRack = new THREE.Mesh(
+        new THREE.BoxGeometry(0.76, 0.18, 0.48),
+        mats.trimMetalMat
+      );
+      topRack.position.set(0, 1.22, -0.04);
+      objGroup.add(topRack);
+    }
+
+    const ringGeo = new THREE.RingGeometry(1.12, 1.34, 28);
     ringGeo.rotateX(-Math.PI / 2);
     const ringMat = new THREE.MeshBasicMaterial({
-      color: obj.type === 'radar_beacon' ? 0x38bdf8 : 0x10b981,
+      color: isRadar ? 0x38bdf8 : 0x10b981,
       transparent: true,
       opacity: 0.68,
       side: THREE.DoubleSide,
@@ -486,7 +599,7 @@ export function buildTacticalArena(mats: TacticalMaterialLibrary): TacticalArena
     arenaGroup.add(objGroup);
   });
 
-  // 10. Exterior Perimeter Cliffs & Industrial Radianite Arcology Skyline
+  // 10. Multi-Part Stratified Exterior Cliffs & Industrial Radianite Arcology Skyline
   const cliffCoords = [
     [-48, -45, 22, 28],
     [45, -48, 24, 30],
@@ -495,13 +608,32 @@ export function buildTacticalArena(mats: TacticalMaterialLibrary): TacticalArena
     [0, -58, 34, 38],
     [0, 58, 30, 28],
   ];
-  cliffCoords.forEach(([cx, cz, rad, h]) => {
-    const peak = new THREE.Mesh(new THREE.ConeGeometry(rad, h, 6), mats.cliffRockMat);
-    peak.position.set(cx, h / 2 - 1, cz);
-    arenaGroup.add(peak);
+  cliffCoords.forEach(([cx, cz, rad, h], idx) => {
+    const massif = new THREE.Group();
+    massif.position.set(cx, 0, cz);
+
+    const mainPeak = new THREE.Mesh(new THREE.ConeGeometry(rad, h, 7), mats.cliffRockMat);
+    mainPeak.position.y = h / 2 - 1;
+    mainPeak.rotation.y = idx * 0.7;
+
+    const secondaryRidge = new THREE.Mesh(
+      new THREE.ConeGeometry(rad * 0.72, h * 0.68, 6),
+      mats.cliffRockMat
+    );
+    secondaryRidge.position.set(rad * 0.42, (h * 0.68) / 2 - 1, -rad * 0.25);
+    secondaryRidge.rotation.y = idx * 1.3;
+
+    const basalCrag = new THREE.Mesh(
+      new THREE.DodecahedronGeometry(rad * 0.48, 0),
+      mats.darkHullMat
+    );
+    basalCrag.position.set(-rad * 0.35, rad * 0.24, rad * 0.3);
+
+    massif.add(mainPeak, secondaryRidge, basalCrag);
+    arenaGroup.add(massif);
   });
 
-  // Tall Exterior Architectural Comms Towers & Floodlight Silos
+  // Tall Multi-Tiered Exterior Architectural Comms Towers & Floodlight Silos
   [
     [-34, -32],
     [34, -32],
@@ -512,16 +644,50 @@ export function buildTacticalArena(mats: TacticalMaterialLibrary): TacticalArena
   ].forEach(([tx, tz], idx) => {
     const tower = new THREE.Group();
     tower.position.set(tx, 0, tz);
-    const body = new THREE.Mesh(new THREE.CylinderGeometry(2.4, 2.8, 20, 12), mats.darkHullMat);
+
+    const basePlinth = new THREE.Mesh(
+      new THREE.CylinderGeometry(3.2, 3.6, 2.4, 8),
+      mats.trimMetalMat
+    );
+    basePlinth.position.y = 1.2;
+
+    const body = new THREE.Mesh(
+      new THREE.CylinderGeometry(2.35, 2.85, 20, 12),
+      mats.darkHullMat
+    );
     body.position.y = 10;
+
+    const midCollar = new THREE.Mesh(
+      new THREE.CylinderGeometry(2.75, 2.75, 1.2, 8),
+      mats.accentWallMat
+    );
+    midCollar.position.y = 11.5;
+
     const glowBand = new THREE.Mesh(
-      new THREE.CylinderGeometry(2.55, 2.55, 0.7, 12),
+      new THREE.CylinderGeometry(2.58, 2.58, 0.75, 12),
       idx % 2 === 0 ? mats.obeliskCoreMat : crimsonStripMat
     );
-    glowBand.position.y = 16.0;
-    const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.4, 9, 8), mats.trimMetalMat);
-    mast.position.y = 24;
-    tower.add(body, glowBand, mast);
+    glowBand.position.y = 16.2;
+
+    const upperDeck = new THREE.Mesh(
+      new THREE.CylinderGeometry(2.9, 2.4, 1.4, 8),
+      mats.trimMetalMat
+    );
+    upperDeck.position.y = 20.4;
+
+    const mast = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.22, 0.42, 9.5, 8),
+      mats.trimMetalMat
+    );
+    mast.position.y = 25.5;
+
+    const beaconTip = new THREE.Mesh(
+      new THREE.SphereGeometry(0.42, 8, 8),
+      idx % 2 === 0 ? cyanStripMat : crimsonStripMat
+    );
+    beaconTip.position.y = 30.4;
+
+    tower.add(basePlinth, body, midCollar, glowBand, upperDeck, mast, beaconTip);
     arenaGroup.add(tower);
   });
 
@@ -707,11 +873,261 @@ export function buildTacticalArena(mats: TacticalMaterialLibrary): TacticalArena
     },
   ];
 
+  // 12. Interactive Parkour Traversal Mechanics:
+  // (A) 6 Neon Kinetic Wall-Run Billboards with Glowing Chevron Speed-Strips
+  const addWallRunBillboard = (
+    id: string,
+    cx: number,
+    cz: number,
+    lengthZ: number,
+    faceDirX: 1 | -1,
+    colorHex: number
+  ) => {
+    const panelGroup = new THREE.Group();
+    panelGroup.position.set(cx, 0, cz);
+
+    const panelMat = new THREE.MeshStandardMaterial({
+      color: 0x0f172a,
+      roughness: 0.3,
+      metalness: 0.78,
+    });
+    const stripMat = new THREE.MeshBasicMaterial({ color: colorHex });
+
+    // Main curved/angled structural wall-run backing plate (spans y = 0.8m to 4.4m)
+    const backing = new THREE.Mesh(new THREE.BoxGeometry(0.32, 3.6, lengthZ), panelMat);
+    backing.position.y = 2.6;
+    backing.castShadow = true;
+    panelGroup.add(backing);
+
+    // Top & bottom neon speed rails
+    [-1.65, 1.65].forEach((ry) => {
+      const rail = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.12, lengthZ + 0.1), stripMat);
+      rail.position.y = 2.6 + ry;
+      panelGroup.add(rail);
+    });
+
+    // Glowing chevron directional bars along the runnable face
+    const chevronCount = Math.max(3, Math.floor(lengthZ / 1.8));
+    for (let i = 0; i < chevronCount; i++) {
+      const zOff = -lengthZ * 0.4 + (lengthZ * 0.8 * i) / Math.max(1, chevronCount - 1);
+      const chevTop = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.75, 0.14), stripMat);
+      chevTop.position.set(faceDirX * 0.18, 2.9, zOff);
+      chevTop.rotation.x = 0.55;
+      const chevBot = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.75, 0.14), stripMat);
+      chevBot.position.set(faceDirX * 0.18, 2.3, zOff);
+      chevBot.rotation.x = -0.55;
+      panelGroup.add(chevTop, chevBot);
+    }
+
+    arenaGroup.add(panelGroup);
+
+    obstacles.push({
+      id,
+      minX: cx - 0.24,
+      maxX: cx + 0.24,
+      minY: 0.6,
+      maxY: 4.5,
+      minZ: cz - lengthZ / 2,
+      maxZ: cz + lengthZ / 2,
+      isCover: true,
+      isWallRunPanel: true,
+    });
+  };
+
+  // Mid Canyon West & East Wall-Run Billboards (attached along the inner faces of the divider walls + mid canyon)
+  addWallRunBillboard('wallrun_mid_west_s', -11.65, 9.0, 7.0, 1, 0x38bdf8);
+  addWallRunBillboard('wallrun_mid_west_n', -11.65, -9.0, 7.0, 1, 0x38bdf8);
+  addWallRunBillboard('wallrun_mid_east_s', 11.65, 9.0, 7.0, -1, 0x10b981);
+  addWallRunBillboard('wallrun_mid_east_n', 11.65, -9.0, 7.0, -1, 0x10b981);
+  // Outer A-Long & B-Link Perimeter Wall-Run Boost Panels
+  addWallRunBillboard('wallrun_outer_west', -26.55, 0, 13.0, 1, 0xf59e0b);
+  addWallRunBillboard('wallrun_outer_east', 26.55, 0, 13.0, -1, 0xe11d48);
+
+  // (B) 4 Elevated Walkable High-Ground Sniper Perches (players can wall-jump or rope-swing onto them!)
+  addBlock('perch_mid_west', -8.8, 4.2, 2.8, 2.6, 3.2, mats.accentWallMat, true, 'crate');
+  addBlock('perch_mid_east', 8.8, -4.2, 2.8, 2.6, 3.2, mats.accentWallMat, true, 'crate');
+  addBlock('perch_west_overlook', -16.2, 0, 2.6, 2.7, 3.4, mats.radianiteCrateMat, true, 'radianite');
+  addBlock('perch_east_overlook', 15.2, 0, 2.6, 2.7, 3.4, mats.radianiteCrateMat, true, 'radianite');
+
+  // (C) 2 Kinetic Jump Pads (South & North Mid approaches for instant vertical launch into rope swings / wall-runs)
+  const addJumpPad = (id: string, label: string, x: number, z: number, boostVy: number) => {
+    jumpPads.push({ id, label, x, y: 0, z, radius: 1.45, boostVy, boostForward: 2.8 });
+
+    const padGroup = new THREE.Group();
+    padGroup.position.set(x, 0.04, z);
+
+    // Octagonal beveled turbine chassis + inner containment ring
+    const base = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.28, 1.44, 0.14, 8),
+      mats.darkHullMat
+    );
+    base.position.y = 0.05;
+
+    const bezelRing = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.08, 1.16, 0.18, 8),
+      mats.trimMetalMat
+    );
+    bezelRing.position.y = 0.06;
+
+    const core = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.88, 0.96, 0.2, 16),
+      new THREE.MeshBasicMaterial({ color: 0x38bdf8 })
+    );
+    core.position.y = 0.075;
+
+    // 4 Cardinal Thruster Stabilizer Pods around the Jump Pad perimeter
+    [
+      [0, 1.24],
+      [0, -1.24],
+      [1.24, 0],
+      [-1.24, 0],
+    ].forEach(([tx, tz]) => {
+      const pod = new THREE.Mesh(
+        new THREE.BoxGeometry(0.32, 0.22, 0.32),
+        mats.trimMetalMat
+      );
+      pod.position.set(tx, 0.09, tz);
+      padGroup.add(pod);
+    });
+
+    const pulseRingGeo = new THREE.RingGeometry(1.15, 1.42, 24);
+    pulseRingGeo.rotateX(-Math.PI / 2);
+    const pulseRing = new THREE.Mesh(
+      pulseRingGeo,
+      new THREE.MeshBasicMaterial({
+        color: 0x38bdf8,
+        transparent: true,
+        opacity: 0.78,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    pulseRing.position.y = 0.13;
+    beaconRings.push(pulseRing);
+
+    padGroup.add(base, bezelRing, core, pulseRing);
+    arenaGroup.add(padGroup);
+  };
+
+  addJumpPad('jumppad_south_mid', 'SOUTH KINETIC LAUNCH PAD', 0, 12.2, 10.6);
+  addJumpPad('jumppad_north_mid', 'NORTH KINETIC LAUNCH PAD', 0, -12.2, 10.6);
+
+  // (D) 6 Overhead Swinging Rope Anchors with Motorized Winch Drums, Plasma Conduits & Grapple Claws
+  const addSwingRopeAnchor = (
+    id: string,
+    label: string,
+    x: number,
+    y: number,
+    z: number,
+    ropeLength: number,
+    colorHex: number
+  ) => {
+    ropeAnchors.push({
+      id,
+      label,
+      x,
+      y,
+      z,
+      ropeLength,
+      grabRadius: 9.8,
+    });
+
+    const ropeGroup = new THREE.Group();
+    ropeGroup.position.set(x, 0, z);
+
+    // Structural ceiling mount flange + dual-flange magnetic winch drum
+    const ceilingBracket = new THREE.Mesh(
+      new THREE.BoxGeometry(0.95, 0.18, 0.95),
+      mats.darkHullMat
+    );
+    ceilingBracket.position.y = y + 0.22;
+
+    const winch = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.4, 0.46, 0.38, 12),
+      mats.trimMetalMat
+    );
+    winch.position.y = y;
+
+    const haloMat = new THREE.MeshBasicMaterial({ color: colorHex });
+    const halo = new THREE.Mesh(new THREE.TorusGeometry(0.58, 0.07, 8, 24), haloMat);
+    halo.rotation.x = Math.PI / 2;
+    halo.position.y = y - 0.12;
+
+    // Hanging braided kinetic plasma rope down from the anchor + intermediate stabilizer collars
+    const cable = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.055, 0.055, ropeLength, 10),
+      haloMat
+    );
+    cable.position.y = y - ropeLength / 2;
+
+    const midCollar1 = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.095, 0.095, 0.14, 10),
+      mats.trimMetalMat
+    );
+    midCollar1.position.y = y - ropeLength * 0.35;
+    const midCollar2 = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.095, 0.095, 0.14, 10),
+      mats.trimMetalMat
+    );
+    midCollar2.position.y = y - ropeLength * 0.7;
+
+    // Glowing grab handle core + 3-prong mechanical grapple claw assembly at the bottom
+    const handle = new THREE.Mesh(new THREE.OctahedronGeometry(0.24, 1), haloMat);
+    handle.position.y = y - ropeLength;
+    const handleCollar = new THREE.Mesh(
+      new THREE.TorusGeometry(0.3, 0.045, 8, 18),
+      mats.trimMetalMat
+    );
+    handleCollar.rotation.x = Math.PI / 2;
+    handleCollar.position.y = y - ropeLength;
+
+    // Subtle floor projection ring underneath each swing rope
+    const floorRingGeo = new THREE.RingGeometry(0.75, 0.95, 24);
+    floorRingGeo.rotateX(-Math.PI / 2);
+    const floorRing = new THREE.Mesh(
+      floorRingGeo,
+      new THREE.MeshBasicMaterial({
+        color: colorHex,
+        transparent: true,
+        opacity: 0.48,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    floorRing.position.y = 0.03;
+    beaconRings.push(floorRing);
+
+    ropeGroup.add(
+      ceilingBracket,
+      winch,
+      halo,
+      cable,
+      midCollar1,
+      midCollar2,
+      handle,
+      handleCollar,
+      floorRing
+    );
+    arenaGroup.add(ropeGroup);
+  };
+
+  // 2 Central Skybridge Grapple Ropes (swing across Mid Reactor Plaza or up onto sniper perches)
+  addSwingRopeAnchor('rope_mid_west', 'MID WEST SKYBRIDGE ROPE', -4.6, 7.35, 0, 4.4, 0xf59e0b);
+  addSwingRopeAnchor('rope_mid_east', 'MID EAST SKYBRIDGE ROPE', 4.6, 7.35, 0, 4.4, 0xf59e0b);
+  // 2 Spawn Portal Grapple Ropes (fast launch out of South/North portals)
+  addSwingRopeAnchor('rope_south_portal', 'SOUTH PORTAL SWING ROPE', 0, 5.2, 14.5, 3.3, 0x38bdf8);
+  addSwingRopeAnchor('rope_north_portal', 'NORTH PORTAL SWING ROPE', 0, 5.2, -14.5, 3.3, 0xe11d48);
+  // 2 Side Lane Gantry Grapple Ropes (West A-Long & East B-Link high-speed swing arcs)
+  addSwingRopeAnchor('rope_west_gantry', 'A-LONG GANTRY SWING ROPE', -19.8, 5.2, 0, 3.3, 0xf59e0b);
+  addSwingRopeAnchor('rope_east_gantry', 'B-LINK GANTRY SWING ROPE', 19.8, 5.2, 0, 3.3, 0x10b981);
+
   return {
     arenaGroup,
     obstacles,
     waypoints,
     objectives,
+    ropeAnchors,
+    jumpPads,
     obeliskCore,
     beaconRings,
     playerSpawn: { x: 0, y: 0, z: 21, yaw: 0 },

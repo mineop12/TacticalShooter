@@ -292,4 +292,5 @@ export const DEFAULT_SETTINGS: GameSettings = {
   graphicsQuality: 'ultra',
   showMinimap: true,
   crosshairColor: '#10b981',
+  showFps: false,
 };

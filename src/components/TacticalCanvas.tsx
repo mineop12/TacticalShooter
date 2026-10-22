@@ -25,11 +25,19 @@ import {
   canPurchaseWeapon,
   checkMatchVictory,
   computeFireCyclePose,
+  computeRopeSwingStep,
   computeSlideVelocityFactor,
+  computeSubtleAimAssist,
+  computeWallJumpImpulse,
+  computeWallRunStep,
   computeWeaponInspectPose,
   computeWeaponReloadPose,
+  cycleWeaponSelection,
+  detectRunnableWall,
   evaluateAITacticalState,
+  findBestRopeAnchor,
   findBestTacticalWaypoint,
+  findSupportFloorHeight,
   hasCorridorClearance,
   hasLineOfSight,
   intersectRayAABB,
@@ -54,7 +62,9 @@ import {
   KillFeedEntry,
   MatchSummaryStats,
   OperativeId,
+  RopeAnchor,
   RoundPhase,
+  WallContact,
   WeaponId,
   WeaponInstanceState,
 } from '../game/types';
@@ -79,6 +89,7 @@ export interface TacticalEngineAPI {
   inspectWeapon: () => void;
   skipBuyPhase: () => void;
   interactObjective: () => void;
+  triggerRopeSwing: () => void;
   toggleBuyMenu: () => void;
   practiceAction: (
     action: 'refill_credits' | 'spawn_bot_mid' | 'sim_round_win' | 'sim_match_win' | 'heal_player'
@@ -285,6 +296,21 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     scene.add(aiTracerLine);
     let aiTracerTimer = 0;
 
+    // Active Overhead Grapple/Swing Rope Tether Line (visible 3D plasma cable during rope swing)
+    const ropeTetherGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(0, 5, 0),
+    ]);
+    const ropeTetherMat = new THREE.LineBasicMaterial({
+      color: new THREE.Color(2.2, 1.55, 0.35),
+      transparent: true,
+      opacity: 0.95,
+    });
+    const ropeTetherLine = new THREE.Line(ropeTetherGeo, ropeTetherMat);
+    ropeTetherLine.frustumCulled = false;
+    ropeTetherLine.visible = false;
+    scene.add(ropeTetherLine);
+
     // 6. Zero-GC Pooled Particle Ring Buffer (InstancedMesh)
     const particleGeo = new THREE.BoxGeometry(0.08, 0.08, 0.08);
     const particleMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
@@ -345,6 +371,33 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     let mouseLeftJustPressed = false;
     let mouseRightHeld = false;
     let pointerLocked = false;
+    let lastPointerUnlockTime = -10000;
+
+    const safeRequestPointerLock = () => {
+      if (document.pointerLockElement === renderer.domElement) return;
+      // Chromium enforces a ~1.25s security cooldown after exiting pointer lock
+      if (performance.now() - lastPointerUnlockTime < 1400) return;
+      try {
+        const lockResult = renderer.domElement.requestPointerLock?.() as unknown;
+        if (lockResult && typeof (lockResult as Promise<unknown>).catch === 'function') {
+          (lockResult as Promise<unknown>).catch(() => {
+            lastPointerUnlockTime = performance.now();
+          });
+        }
+      } catch {
+        lastPointerUnlockTime = performance.now();
+      }
+    };
+
+    const safeExitPointerLock = () => {
+      if (document.pointerLockElement) {
+        lastPointerUnlockTime = performance.now();
+        try {
+          document.exitPointerLock?.();
+        } catch {}
+      }
+      pointerLocked = false;
+    };
 
     const createInitialInventory = (): Record<WeaponId, WeaponInstanceState | null> => ({
       pistol: {
@@ -378,6 +431,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       playerVz: 0,
       playerYaw: arena.playerSpawn.yaw,
       playerPitch: 0,
+      aimAssistSensScale: 1.0,
       recoilPitchOffset: 0,
       recoilYawOffset: 0,
       isGrounded: true,
@@ -391,6 +445,16 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       slideCooldown: 0,
       slideDirX: 0,
       slideDirZ: -1,
+      isWallRunning: false,
+      wallRunSide: null as 'left' | 'right' | null,
+      wallRunTimer: 0,
+      wallRunCooldown: 0,
+      activeWallContact: null as WallContact | null,
+      isSwinging: false,
+      activeRopeAnchor: null as RopeAnchor | null,
+      activeRopeLength: 4.0,
+      ropeCooldown: 0,
+      jumpPadCooldown: 0,
       cameraRoll: 0,
       playerHealth: 100,
       playerArmor: 0,
@@ -499,11 +563,16 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       remoteTargetZ: -18.5,
       remoteTargetYaw: Math.PI,
       remoteSpeed: 0,
+      fps: 60,
+      frameTimeMs: 16.6,
     };
 
     const syncBodyDataset = (state: GameAppState) => {
       document.body.dataset.state = state;
     };
+
+    let fpsFrames = 0;
+    let fpsAccumTime = 0;
 
     const emitHudSnapshot = () => {
       const activeWeapon =
@@ -529,6 +598,21 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         sim.isPracticeMode ||
         sim.reconRevealTimer > 0 ||
         sim.aiLastSawPlayerTime > performance.now() / 1000 - 2.0;
+
+      const nearbyRopeAnchor = sim.isSwinging
+        ? sim.activeRopeAnchor
+        : findBestRopeAnchor(
+            sim.playerX,
+            sim.playerY,
+            sim.playerZ,
+            sim.playerYaw,
+            sim.playerPitch,
+            arena.ropeAnchors
+          );
+
+      const canWallJump =
+        sim.isWallRunning ||
+        (!sim.isGrounded && !sim.isSwinging && sim.activeWallContact !== null);
 
       onHudUpdateRef.current({
         appState: sim.appState,
@@ -561,6 +645,12 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           keysHeld.has('KeyC'),
         isSliding: sim.isSliding,
         isWalking: keysHeld.has('ShiftLeft') || keysHeld.has('ShiftRight'),
+        isWallRunning: sim.isWallRunning,
+        wallRunSide: sim.wallRunSide,
+        isSwinging: sim.isSwinging,
+        activeRopeAnchorId: sim.activeRopeAnchor?.id ?? null,
+        nearbyRopeAnchor,
+        canWallJump,
         aiHealth: sim.aiHealth,
         aiMaxHealth: 100,
         aiArmor: sim.aiArmor,
@@ -586,6 +676,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         opponentOperative: sim.opponentOperative ?? undefined,
         opponentConnected: sim.opponentConnected,
         pingMs: sim.pingMs,
+        fps: sim.fps,
+        frameTimeMs: sim.frameTimeMs,
       });
     };
 
@@ -612,6 +704,15 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       sim.isSliding = false;
       sim.slideTimer = 0;
       sim.slideCooldown = 0;
+      sim.isWallRunning = false;
+      sim.wallRunSide = null;
+      sim.wallRunTimer = 0;
+      sim.wallRunCooldown = 0;
+      sim.activeWallContact = null;
+      sim.isSwinging = false;
+      sim.activeRopeAnchor = null;
+      sim.ropeCooldown = 0;
+      ropeTetherLine.visible = false;
       sim.cameraRoll = 0;
       sim.playerHealth = 100;
       sim.isReloading = false;
@@ -704,10 +805,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       sim.roundPhase = 'match_over';
       sim.appState = 'gameover';
       syncBodyDataset('gameover');
-      try {
-        document.exitPointerLock?.();
-      } catch {}
-      pointerLocked = false;
+      safeExitPointerLock();
       keysHeld.clear();
       mouseLeftHeld = false;
       mouseRightHeld = false;
@@ -856,14 +954,17 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         sim.aiLastSawPlayerTime = nowSecForShot - 1.4;
       }
 
-      // Movement & stance spread calculation
+      // Movement & stance spread calculation (Wall-running & Rope-swinging retain stabilized tactical gun accuracy)
       const speedHoriz = Math.hypot(sim.playerVx, sim.playerVz);
       const isCrouching =
         keysHeld.has('ControlLeft') || keysHeld.has('ControlRight') || keysHeld.has('KeyC');
-      let currentSpread = spec.baseSpread + (speedHoriz / 7.0) * spec.moveSpreadPenalty;
+      const effectiveSpeed = sim.isWallRunning || sim.isSwinging ? speedHoriz * 0.42 : speedHoriz;
+      let currentSpread = spec.baseSpread + (effectiveSpeed / 7.0) * spec.moveSpreadPenalty;
       if (mouseRightHeld) currentSpread *= spec.adsSpreadMultiplier;
       if (isCrouching) currentSpread *= 0.65;
-      if (!sim.isGrounded) currentSpread += 0.065;
+      if (!sim.isGrounded) {
+        currentSpread += sim.isWallRunning || sim.isSwinging ? 0.016 : 0.055;
+      }
 
       camera.getWorldPosition(_rayOrigin);
 
@@ -891,6 +992,35 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
 
       if (!baseDirSet) {
         camera.getWorldDirection(_forward);
+        // Subtle bullet magnetism when aiming within ~2.2 deg of a visible opponent
+        if (
+          sim.aiHealth > 0 &&
+          hasLineOfSight(
+            _rayOrigin.x,
+            _rayOrigin.y,
+            _rayOrigin.z,
+            sim.aiX,
+            sim.aiY + 1.38 - sim.aiCrouchOffset,
+            sim.aiZ,
+            arena.obstacles
+          )
+        ) {
+          const assist = computeSubtleAimAssist(
+            _rayOrigin.x,
+            _rayOrigin.y,
+            _rayOrigin.z,
+            sim.playerYaw + sim.recoilYawOffset,
+            sim.playerPitch + sim.recoilPitchOffset,
+            sim.aiX,
+            sim.aiY - sim.aiCrouchOffset,
+            sim.aiZ,
+            0.016,
+            mouseRightHeld || sim.isWallRunning || sim.isSwinging
+          );
+          if (assist.engaged && assist.magnetStrength > 0) {
+            _forward.set(assist.magnetDirX, assist.magnetDirY, assist.magnetDirZ).normalize();
+          }
+        }
       }
 
       let totalHitDamage = 0;
@@ -1155,6 +1285,61 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           break;
         }
       }
+    };
+
+    // Attach to or detach from an overhead Swinging Rope Anchor ([Q] or [G] key)
+    const toggleRopeSwing = () => {
+      if (sim.appState !== 'playing' || sim.playerHealth <= 0) return;
+
+      if (sim.isSwinging) {
+        // Release rope with a forward/upward pendulum launch boost
+        sim.isSwinging = false;
+        sim.activeRopeAnchor = null;
+        sim.ropeCooldown = 0.28;
+        ropeTetherLine.visible = false;
+        sim.playerVy = Math.max(sim.playerVy + 2.6, 6.2);
+        sim.playerVx *= 1.12;
+        sim.playerVz *= 1.12;
+        soundEngine.playRopeAttach(true);
+        emitHudSnapshot();
+        return;
+      }
+
+      if (sim.ropeCooldown > 0) return;
+
+      const anchor = findBestRopeAnchor(
+        sim.playerX,
+        sim.playerY,
+        sim.playerZ,
+        sim.playerYaw,
+        sim.playerPitch,
+        arena.ropeAnchors
+      );
+      if (!anchor) return;
+
+      sim.isSwinging = true;
+      sim.activeRopeAnchor = anchor;
+      sim.activeRopeLength = anchor.ropeLength;
+      sim.isWallRunning = false;
+      sim.wallRunSide = null;
+      sim.isSliding = false;
+      sim.slideTimer = 0;
+
+      // If grabbing from the floor or low velocity, give an initial grapple lift + forward swing momentum
+      if (sim.isGrounded) {
+        sim.isGrounded = false;
+        sim.playerY += 0.35;
+        sim.playerVy = Math.max(sim.playerVy, 4.4);
+      }
+      const fwdX = -Math.sin(sim.playerYaw);
+      const fwdZ = -Math.cos(sim.playerYaw);
+      if (Math.hypot(sim.playerVx, sim.playerVz) < 6.5) {
+        sim.playerVx += fwdX * 5.8;
+        sim.playerVz += fwdZ * 5.8;
+      }
+
+      soundEngine.playRopeAttach(false);
+      emitHudSnapshot();
     };
 
     // ====================================================================
@@ -1531,10 +1716,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         if (sim.appState === 'playing') {
           sim.appState = 'paused';
           syncBodyDataset('paused');
-          try {
-            document.exitPointerLock?.();
-          } catch {}
-          pointerLocked = false;
+          safeExitPointerLock();
           keysHeld.clear();
           mouseLeftHeld = false;
           mouseRightHeld = false;
@@ -1549,10 +1731,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         aiRig.root.visible = true;
         sim.appState = 'title';
         syncBodyDataset('title');
-        try {
-          document.exitPointerLock?.();
-        } catch {}
-        pointerLocked = false;
+        safeExitPointerLock();
         keysHeld.clear();
         mouseLeftHeld = false;
         mouseRightHeld = false;
@@ -1641,6 +1820,10 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         triggerObjectiveInteract();
       },
 
+      triggerRopeSwing: () => {
+        toggleRopeSwing();
+      },
+
       toggleBuyMenu: () => {
         onToggleBuyMenuRef.current();
       },
@@ -1697,9 +1880,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       },
 
       requestPointerLock: () => {
-        try {
-          renderer.domElement.requestPointerLock?.();
-        } catch {}
+        safeRequestPointerLock();
       },
     };
 
@@ -1762,6 +1943,9 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         triggerWeaponInspect();
       } else if (e.code === 'KeyE') {
         triggerObjectiveInteract();
+      } else if (e.code === 'KeyQ' || e.code === 'KeyG') {
+        e.preventDefault();
+        toggleRopeSwing();
       } else if (e.code === 'Digit1' && sim.ownedWeapons.pistol) {
         api.equipWeapon('pistol');
       } else if (e.code === 'Digit2' && sim.ownedWeapons.smg) {
@@ -1821,9 +2005,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         mouseLeftHeld = true;
         mouseLeftJustPressed = true;
         if (!pointerLocked) {
-          try {
-            renderer.domElement.requestPointerLock?.();
-          } catch {}
+          safeRequestPointerLock();
         }
         firePlayerWeapon(e.clientX, e.clientY);
       } else if (e.button === 2) {
@@ -1840,7 +2022,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
 
     const onMouseMove = (e: MouseEvent) => {
       if (sim.appState !== 'playing') return;
-      const sens = settingsRef.current.mouseSensitivity * 0.0022;
+      const sens =
+        settingsRef.current.mouseSensitivity * 0.0022 * (sim.aimAssistSensScale || 1.0);
       if (document.pointerLockElement === renderer.domElement) {
         const dyaw = -e.movementX * sens;
         const dpitch = -e.movementY * sens;
@@ -1866,6 +2049,16 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     };
 
     const onPointerLockChange = () => {
+      const nowLocked = document.pointerLockElement === renderer.domElement;
+      if (pointerLocked && !nowLocked) {
+        lastPointerUnlockTime = performance.now();
+      }
+      pointerLocked = nowLocked;
+      emitHudSnapshot();
+    };
+
+    const onPointerLockError = () => {
+      lastPointerUnlockTime = performance.now();
       pointerLocked = document.pointerLockElement === renderer.domElement;
       emitHudSnapshot();
     };
@@ -1873,6 +2066,29 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     const onContextMenu = (e: MouseEvent) => {
       if (e.target === renderer.domElement) {
         e.preventDefault();
+      }
+    };
+
+    let lastWheelTime = 0;
+    const onWheel = (e: WheelEvent) => {
+      if (sim.appState !== 'playing') return;
+      // Prevent browser scroll/zoom when playing match
+      e.preventDefault();
+
+      const now = performance.now();
+      // Throttle to 90ms to handle smooth wheel notches and avoid over-cycling
+      if (now - lastWheelTime < 90) return;
+      if (Math.abs(e.deltaY) < 2) return;
+
+      const nextWeaponId = cycleWeaponSelection(
+        sim.ownedWeapons,
+        sim.activeWeaponId,
+        e.deltaY > 0 ? 'next' : 'prev'
+      );
+
+      if (nextWeaponId !== sim.activeWeaponId) {
+        lastWheelTime = now;
+        api.equipWeapon(nextWeaponId);
       }
     };
 
@@ -1920,7 +2136,9 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('blur', onBlurOrVisibility);
     document.addEventListener('pointerlockchange', onPointerLockChange);
+    document.addEventListener('pointerlockerror', onPointerLockError);
     document.addEventListener('contextmenu', onContextMenu);
+    window.addEventListener('wheel', onWheel, { passive: false });
 
     // 10. Main 60Hz Simulation & Software-WebGL Paced Loop
     let lastTimeMs = performance.now();
@@ -1955,6 +2173,16 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       lastTimeMs = nowMs;
       const dt = Math.min(rawDt, 0.05); // Clamp frame delta time <= 0.05s
       const elapsed = (nowMs - startTimeMs) / 1000;
+
+      // Real-time FPS & frame time measurement (~4Hz update rate for jitter-free display)
+      fpsFrames++;
+      fpsAccumTime += rawDt;
+      if (fpsAccumTime >= 0.25) {
+        sim.fps = Math.max(1, Math.round(fpsFrames / fpsAccumTime));
+        sim.frameTimeMs = Math.round((fpsAccumTime / fpsFrames) * 1000 * 10) / 10;
+        fpsFrames = 0;
+        fpsAccumTime = 0;
+      }
 
       // Animate central obelisk reactor & objective rings
       arena.obeliskCore.rotation.y = elapsed * 0.9;
@@ -2127,6 +2355,15 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           if (sim.slideCooldown > 0) {
             sim.slideCooldown = Math.max(0, sim.slideCooldown - dt);
           }
+          if (sim.wallRunCooldown > 0) {
+            sim.wallRunCooldown = Math.max(0, sim.wallRunCooldown - dt);
+          }
+          if (sim.ropeCooldown > 0) {
+            sim.ropeCooldown = Math.max(0, sim.ropeCooldown - dt);
+          }
+          if (sim.jumpPadCooldown > 0) {
+            sim.jumpPadCooldown = Math.max(0, sim.jumpPadCooldown - dt);
+          }
 
           const forwardInput =
             (keysHeld.has('KeyW') ? 1 : 0) - (keysHeld.has('KeyS') ? 1 : 0);
@@ -2141,109 +2378,285 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           _moveVec.addScaledVector(_right, rightInput);
 
           const currentHorizSpeed = Math.hypot(sim.playerVx, sim.playerVz);
+          const prevPlayerY = sim.playerY;
+          const isCrouching =
+            crouchKeyHeld && !sim.isSliding && !sim.isSwinging && !sim.isWallRunning;
 
-          // Initiate Tactical Knee-Slide when pressing Crouch ([Ctrl]/[C]) while running or pressing [X]
-          if (
-            crouchJustPressed &&
-            sim.isGrounded &&
-            !sim.isSliding &&
-            sim.slideCooldown <= 0 &&
-            !isWalking &&
-            (currentHorizSpeed > 3.1 || keysJustPressed.has('KeyX'))
-          ) {
-            sim.isSliding = true;
-            sim.slideDuration = 0.68;
-            sim.slideTimer = sim.slideDuration;
-            sim.slideCooldown = 1.05;
-            if (_moveVec.lengthSq() > 0.001) {
-              _moveVec.normalize();
-              sim.slideDirX = _moveVec.x;
-              sim.slideDirZ = _moveVec.z;
-            } else {
-              sim.slideDirX = _forward.x;
-              sim.slideDirZ = _forward.z;
-            }
-            sim.jumpLandDip = -0.035;
-            soundEngine.playTacticalSlide();
-            // AI hears tactical slide friction within 22m
-            if (Math.hypot(sim.playerX - sim.aiX, sim.playerZ - sim.aiZ) <= 22.0) {
-              sim.aiLastKnownPlayerX = sim.playerX;
-              sim.aiLastKnownPlayerZ = sim.playerZ;
-            }
-            emitHudSnapshot();
-          }
+          // Detect nearby runnable wall when airborne (for Wall-Run and Wall-Jump)
+          const detectedWall = !sim.isGrounded && !sim.isSwinging
+            ? detectRunnableWall(
+                sim.playerX,
+                sim.playerY,
+                sim.playerZ,
+                sim.playerVx,
+                sim.playerVz,
+                sim.playerYaw,
+                arena.obstacles
+              )
+            : null;
+          sim.activeWallContact = detectedWall;
 
-          if (sim.isSliding) {
-            sim.slideTimer -= dt;
-            if (sim.slideTimer <= 0 || !sim.isGrounded) {
-              sim.isSliding = false;
-              sim.slideTimer = 0;
+          // ==================================================================
+          // MECHANIC 1: OVERHEAD ROPE SWINGING (3D Pendulum + Full Gun Control)
+          // ==================================================================
+          if (sim.isSwinging && sim.activeRopeAnchor) {
+            // Jump [Space] while swinging vaults the player off the rope with momentum!
+            if (keysJustPressed.has('Space')) {
+              sim.isSwinging = false;
+              sim.activeRopeAnchor = null;
+              sim.ropeCooldown = 0.28;
+              ropeTetherLine.visible = false;
+              sim.playerVy = Math.max(sim.playerVy + 3.4, 7.6);
+              sim.playerVx = sim.playerVx * 1.15 + _forward.x * 2.2;
+              sim.playerVz = sim.playerVz * 1.15 + _forward.z * 2.2;
+              sim.jumpLandDip = 0.036;
+              soundEngine.playRopeAttach(true);
               emitHudSnapshot();
             } else {
-              const slideProgress = 1 - sim.slideTimer / sim.slideDuration;
-              const slideSpeed =
-                6.8 * spec.moveSpeedMultiplier * computeSlideVelocityFactor(slideProgress);
-              sim.playerVx = sim.slideDirX * slideSpeed;
-              sim.playerVz = sim.slideDirZ * slideSpeed;
+              const wishDirX = _moveVec.lengthSq() > 0.001 ? _moveVec.x : _forward.x * 0.35;
+              const wishDirZ = _moveVec.lengthSq() > 0.001 ? _moveVec.z : _forward.z * 0.35;
+              const swingStep = computeRopeSwingStep(
+                sim.playerX,
+                sim.playerY,
+                sim.playerZ,
+                sim.playerVx,
+                sim.playerVy,
+                sim.playerVz,
+                wishDirX,
+                wishDirZ,
+                sim.activeRopeAnchor,
+                sim.activeRopeLength,
+                dt
+              );
+              sim.playerX = THREE.MathUtils.clamp(swingStep.x, -26.5, 26.5);
+              sim.playerY = Math.max(0.25, swingStep.y);
+              sim.playerZ = THREE.MathUtils.clamp(swingStep.z, -24.5, 24.5);
+              sim.playerVx = swingStep.vx;
+              sim.playerVy = swingStep.vy;
+              sim.playerVz = swingStep.vz;
+
+              // Update 3D glowing tether cable from player chest harness to overhead winch
+              ropeTetherLine.visible = true;
+              const ropeAttr = ropeTetherGeo.getAttribute('position') as THREE.BufferAttribute;
+              ropeAttr.setXYZ(
+                0,
+                sim.playerX + _right.x * -0.22,
+                sim.playerY + 1.15,
+                sim.playerZ + _right.z * -0.22
+              );
+              ropeAttr.setXYZ(
+                1,
+                sim.activeRopeAnchor.x,
+                sim.activeRopeAnchor.y,
+                sim.activeRopeAnchor.z
+              );
+              ropeAttr.needsUpdate = true;
             }
-          }
+          } else {
+            ropeTetherLine.visible = false;
 
-          const isCrouching = crouchKeyHeld && !sim.isSliding;
+            // ================================================================
+            // MECHANIC 2: WALL RUN & WALL JUMP (Parkour Glide + Full Gunplay)
+            // ================================================================
+            const wantsWallRun =
+              !sim.isGrounded &&
+              sim.wallRunCooldown <= 0 &&
+              detectedWall !== null &&
+              (forwardInput > 0 || currentHorizSpeed > 3.2);
 
-          if (!sim.isSliding) {
-            let maxMoveSpeed = 6.8 * spec.moveSpeedMultiplier;
-            if (isWalking) maxMoveSpeed *= 0.54;
-            if (isCrouching) maxMoveSpeed *= 0.48;
-            if (mouseRightHeld) maxMoveSpeed *= 0.76;
+            if (wantsWallRun && detectedWall) {
+              if (!sim.isWallRunning) {
+                sim.isWallRunning = true;
+                sim.wallRunTimer = 0;
+              }
+              sim.wallRunSide = detectedWall.side;
+              sim.wallRunTimer += dt;
 
-            if (_moveVec.lengthSq() > 0.001) {
-              _moveVec.normalize().multiplyScalar(maxMoveSpeed);
+              const wrStep = computeWallRunStep(
+                sim.playerVx,
+                sim.playerVy,
+                sim.playerVz,
+                detectedWall,
+                sim.wallRunTimer,
+                dt
+              );
+              sim.playerVx = wrStep.vx;
+              sim.playerVy = wrStep.vy;
+              sim.playerVz = wrStep.vz;
+
+              if (wrStep.shouldDetach) {
+                sim.isWallRunning = false;
+                sim.wallRunSide = null;
+                sim.wallRunCooldown = 0.24;
+              }
+            } else if (sim.isWallRunning) {
+              sim.isWallRunning = false;
+              sim.wallRunSide = null;
             }
 
-            const accel = sim.isGrounded ? 18.0 : 5.5;
-            sim.playerVx = THREE.MathUtils.damp(sim.playerVx, _moveVec.x, accel, dt);
-            sim.playerVz = THREE.MathUtils.damp(sim.playerVz, _moveVec.z, accel, dt);
-          }
+            // Initiate Tactical Knee-Slide when pressing Crouch ([Ctrl]/[C]) while running or pressing [X]
+            if (
+              crouchJustPressed &&
+              sim.isGrounded &&
+              !sim.isSliding &&
+              sim.slideCooldown <= 0 &&
+              !isWalking &&
+              (currentHorizSpeed > 3.1 || keysJustPressed.has('KeyX'))
+            ) {
+              sim.isSliding = true;
+              sim.slideDuration = 0.68;
+              sim.slideTimer = sim.slideDuration;
+              sim.slideCooldown = 1.05;
+              if (_moveVec.lengthSq() > 0.001) {
+                _moveVec.normalize();
+                sim.slideDirX = _moveVec.x;
+                sim.slideDirZ = _moveVec.z;
+              } else {
+                sim.slideDirX = _forward.x;
+                sim.slideDirZ = _forward.z;
+              }
+              sim.jumpLandDip = -0.035;
+              soundEngine.playTacticalSlide();
+              if (Math.hypot(sim.playerX - sim.aiX, sim.playerZ - sim.aiZ) <= 22.0) {
+                sim.aiLastKnownPlayerX = sim.playerX;
+                sim.aiLastKnownPlayerZ = sim.playerZ;
+              }
+              emitHudSnapshot();
+            }
 
-          // Coyote time & Jump buffer (Jumping during a slide performs a momentum slide-jump!)
-          if (sim.isGrounded) {
-            sim.coyoteTimer = 0.1;
-          } else {
-            sim.coyoteTimer = Math.max(0, sim.coyoteTimer - dt);
-          }
-
-          if (keysJustPressed.has('Space')) {
-            sim.jumpBufferTimer = 0.12;
-          } else {
-            sim.jumpBufferTimer = Math.max(0, sim.jumpBufferTimer - dt);
-          }
-
-          if (sim.jumpBufferTimer > 0 && sim.coyoteTimer > 0) {
             if (sim.isSliding) {
-              sim.isSliding = false;
-              sim.slideTimer = 0;
-              sim.playerVx *= 1.08;
-              sim.playerVz *= 1.08;
+              sim.slideTimer -= dt;
+              if (sim.slideTimer <= 0 || !sim.isGrounded) {
+                sim.isSliding = false;
+                sim.slideTimer = 0;
+                emitHudSnapshot();
+              } else {
+                const slideProgress = 1 - sim.slideTimer / sim.slideDuration;
+                const slideSpeed =
+                  6.8 * spec.moveSpeedMultiplier * computeSlideVelocityFactor(slideProgress);
+                sim.playerVx = sim.slideDirX * slideSpeed;
+                sim.playerVz = sim.slideDirZ * slideSpeed;
+              }
             }
-            sim.playerVy = 7.4;
-            sim.isGrounded = false;
-            sim.coyoteTimer = 0;
-            sim.jumpBufferTimer = 0;
-            sim.jumpLandDip = 0.032; // Upward takeoff impulse on weapon
-            soundEngine.playJump(false);
+
+            if (!sim.isSliding && !sim.isWallRunning) {
+              let maxMoveSpeed = 6.8 * spec.moveSpeedMultiplier;
+              if (isWalking) maxMoveSpeed *= 0.54;
+              if (isCrouching) maxMoveSpeed *= 0.48;
+              if (mouseRightHeld) maxMoveSpeed *= 0.76;
+
+              if (_moveVec.lengthSq() > 0.001) {
+                _moveVec.normalize().multiplyScalar(maxMoveSpeed);
+              }
+
+              const accel = sim.isGrounded ? 18.0 : 5.5;
+              sim.playerVx = THREE.MathUtils.damp(sim.playerVx, _moveVec.x, accel, dt);
+              sim.playerVz = THREE.MathUtils.damp(sim.playerVz, _moveVec.z, accel, dt);
+            }
+
+            // Coyote time & Jump buffer (Supports Ground Jump, Slide-Jump, and Wall-Jump!)
+            if (sim.isGrounded) {
+              sim.coyoteTimer = 0.1;
+            } else {
+              sim.coyoteTimer = Math.max(0, sim.coyoteTimer - dt);
+            }
+
+            if (keysJustPressed.has('Space')) {
+              sim.jumpBufferTimer = 0.12;
+            } else {
+              sim.jumpBufferTimer = Math.max(0, sim.jumpBufferTimer - dt);
+            }
+
+            // WALL JUMP: Pressing Space while wall-running or airborne near a wall!
+            if (sim.jumpBufferTimer > 0 && !sim.isGrounded && detectedWall) {
+              const wj = computeWallJumpImpulse(
+                sim.playerVx,
+                sim.playerVz,
+                sim.playerYaw,
+                detectedWall
+              );
+              sim.playerVx = wj.vx;
+              sim.playerVy = wj.vy;
+              sim.playerVz = wj.vz;
+              sim.isWallRunning = false;
+              sim.wallRunSide = null;
+              sim.wallRunCooldown = 0.18;
+              sim.jumpBufferTimer = 0;
+              sim.coyoteTimer = 0;
+              sim.jumpLandDip = 0.04;
+              soundEngine.playWallJump();
+              spawnParticles(
+                sim.playerX - detectedWall.normalX * 0.4,
+                sim.playerY + 1.0,
+                sim.playerZ - detectedWall.normalZ * 0.4,
+                8,
+                0x38bdf8,
+                4.2
+              );
+              emitHudSnapshot();
+            } else if (sim.jumpBufferTimer > 0 && sim.coyoteTimer > 0) {
+              // Standard Ground Jump or Slide-Jump
+              if (sim.isSliding) {
+                sim.isSliding = false;
+                sim.slideTimer = 0;
+                sim.playerVx *= 1.08;
+                sim.playerVz *= 1.08;
+              }
+              sim.playerVy = 7.4;
+              sim.isGrounded = false;
+              sim.coyoteTimer = 0;
+              sim.jumpBufferTimer = 0;
+              sim.jumpLandDip = 0.032;
+              soundEngine.playJump(false);
+            }
+
+            // Gravity & vertical integration (Wall-run already applied reduced gravity in computeWallRunStep)
+            if (!sim.isWallRunning) {
+              sim.playerVy -= 20.0 * dt;
+            }
+            sim.playerY += sim.playerVy * dt;
+
+            // Check walkable elevated floors (crates & sniper perches) + ground plane
+            const supportFloorY = findSupportFloorHeight(
+              sim.playerX,
+              sim.playerZ,
+              prevPlayerY,
+              sim.playerY,
+              0.44,
+              arena.obstacles
+            );
+            if (sim.playerY <= supportFloorY && sim.playerVy <= 0) {
+              if (!sim.isGrounded && sim.playerVy < -2.0) {
+                soundEngine.playJump(true);
+                sim.jumpLandDip = -0.055;
+              }
+              sim.playerY = supportFloorY;
+              sim.playerVy = 0;
+              sim.isGrounded = true;
+              sim.isWallRunning = false;
+              sim.wallRunSide = null;
+              sim.wallRunTimer = 0;
+            } else if (sim.playerY > supportFloorY + 0.04) {
+              sim.isGrounded = false;
+            }
           }
 
-          // Gravity & vertical integration
-          sim.playerVy -= 20.0 * dt;
-          sim.playerY += sim.playerVy * dt;
-          if (sim.playerY <= 0) {
-            if (!sim.isGrounded && sim.playerVy < -2.0) {
-              soundEngine.playJump(true);
-              sim.jumpLandDip = -0.055; // Crisp landing compression dip on weapon & arms
+          // Check Kinetic Jump Pads for instant vertical launch into wall-run & rope-swing routes
+          if (sim.jumpPadCooldown <= 0 && sim.playerY <= 0.65) {
+            for (let i = 0; i < arena.jumpPads.length; i++) {
+              const pad = arena.jumpPads[i];
+              if (Math.hypot(sim.playerX - pad.x, sim.playerZ - pad.z) <= pad.radius) {
+                sim.playerVy = pad.boostVy;
+                sim.isGrounded = false;
+                sim.isSliding = false;
+                sim.jumpPadCooldown = 0.45;
+                sim.jumpLandDip = 0.045;
+                soundEngine.playJumpPad();
+                spawnParticles(pad.x, 0.2, pad.z, 12, 0x38bdf8, 5.2);
+                emitHudSnapshot();
+                break;
+              }
             }
-            sim.playerY = 0;
-            sim.playerVy = 0;
-            sim.isGrounded = true;
           }
 
           // Horizontal collision resolution against arena AABBs + stability bounds clamp
@@ -2266,15 +2679,15 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             sim.slideTimer = 0;
           }
 
-          // Footsteps, Acoustic AI Alert & Walk Bob synced to actual distance traveled
+          // Footsteps, Acoustic AI Alert & Walk Bob synced to actual distance traveled (includes rapid Wall-Run steps)
           const stepDist = Math.hypot(sim.playerVx, sim.playerVz) * dt;
-          if (sim.isGrounded && !sim.isSliding && stepDist > 0.001) {
-            sim.walkBobPhase += stepDist * 2.35;
+          if ((sim.isGrounded || sim.isWallRunning) && !sim.isSliding && stepDist > 0.001) {
+            sim.walkBobPhase += stepDist * (sim.isWallRunning ? 3.1 : 2.35);
             sim.footstepAccum += stepDist;
-            if (sim.footstepAccum >= 2.3 && !isWalking && !isCrouching) {
+            const stepThreshold = sim.isWallRunning ? 1.65 : 2.3;
+            if (sim.footstepAccum >= stepThreshold && (!isWalking || sim.isWallRunning) && !isCrouching) {
               sim.footstepAccum = 0;
               soundEngine.playFootstep(false);
-              // AI hears loud un-shifted footsteps within 28m!
               if (Math.hypot(sim.playerX - sim.aiX, sim.playerZ - sim.aiZ) <= 28.0) {
                 sim.aiLastKnownPlayerX = sim.playerX;
                 sim.aiLastKnownPlayerZ = sim.playerZ;
@@ -2337,8 +2750,59 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             sim.playerZ + _right.z * bobOffsetX
           );
 
-          const targetCameraRoll = (sim.isSliding ? 0.055 : 0) + bobRollZ;
-          sim.cameraRoll = THREE.MathUtils.damp(sim.cameraRoll, targetCameraRoll, 16, dt);
+          // Subtle, non-intrusive rotational aim assist when opponent is in LOS & within ~4.5-5.8 deg
+          if (
+            sim.aiHealth > 0 &&
+            hasLineOfSight(
+              camera.position.x,
+              camera.position.y,
+              camera.position.z,
+              sim.aiX,
+              sim.aiY + 1.38 - sim.aiCrouchOffset,
+              sim.aiZ,
+              arena.obstacles
+            )
+          ) {
+            const isHighMobilityOrAds =
+              mouseRightHeld || sim.isWallRunning || sim.isSwinging;
+            const assist = computeSubtleAimAssist(
+              camera.position.x,
+              camera.position.y,
+              camera.position.z,
+              sim.playerYaw,
+              sim.playerPitch,
+              sim.aiX,
+              sim.aiY - sim.aiCrouchOffset,
+              sim.aiZ,
+              dt,
+              isHighMobilityOrAds
+            );
+            sim.aimAssistSensScale = assist.sensitivityScale;
+            // Only apply gentle rotational tracking when player is moving, aiming, shooting, or parkouring
+            if (
+              assist.engaged &&
+              (currentHorizSpeed > 0.35 ||
+                mouseRightHeld ||
+                mouseLeftHeld ||
+                sim.isWallRunning ||
+                sim.isSwinging)
+            ) {
+              sim.playerYaw = assist.nextYaw;
+              sim.playerPitch = assist.nextPitch;
+            }
+          } else {
+            sim.aimAssistSensScale = 1.0;
+          }
+
+          const wallRunTilt = sim.isWallRunning
+            ? sim.wallRunSide === 'left'
+              ? 0.19
+              : -0.19
+            : sim.isSwinging
+              ? Math.max(-0.12, Math.min(0.12, -sim.playerVx * 0.008))
+              : 0;
+          const targetCameraRoll = (sim.isSliding ? 0.055 : 0) + wallRunTilt + bobRollZ;
+          sim.cameraRoll = THREE.MathUtils.damp(sim.cameraRoll, targetCameraRoll, 14, dt);
 
           // Smooth deterministic damage flinch (only when hit by enemy, no random white-noise jitter)
           const flinchPitch = sim.cameraTrauma * sim.cameraTrauma * 0.018;
@@ -2351,12 +2815,18 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           );
           camera.quaternion.setFromEuler(_euler);
 
-          // ADS FOV interpolation (with subtle widening burst during knee-slide)
-          const slideFovBoost = sim.isSliding ? 4.5 : 0;
+          // ADS FOV interpolation (with subtle widening burst during knee-slide, wall-run, or rope-swing)
+          const traversalFovBoost = sim.isSwinging
+            ? 6.0
+            : sim.isWallRunning
+              ? 5.0
+              : sim.isSliding
+                ? 4.5
+                : 0;
           const targetFov =
             (mouseRightHeld
               ? settingsRef.current.fov * spec.adsFovMultiplier
-              : settingsRef.current.fov) + slideFovBoost;
+              : settingsRef.current.fov) + traversalFovBoost;
           if (Math.abs(camera.fov - targetFov) > 0.05) {
             camera.fov = THREE.MathUtils.damp(camera.fov, targetFov, 14, dt);
             camera.updateProjectionMatrix();
@@ -3249,7 +3719,9 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('blur', onBlurOrVisibility);
       document.removeEventListener('pointerlockchange', onPointerLockChange);
+      document.removeEventListener('pointerlockerror', onPointerLockError);
       document.removeEventListener('contextmenu', onContextMenu);
+      window.removeEventListener('wheel', onWheel);
       composer.dispose();
       mats.dispose();
       renderer.dispose();

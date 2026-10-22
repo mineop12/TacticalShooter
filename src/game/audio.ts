@@ -562,6 +562,80 @@ class SoundEngine {
     } catch {}
   }
 
+  public playWallJump() {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    try {
+      const now = ctx.currentTime;
+      const vol = this.masterVolume * 0.34;
+
+      // Crisp kinetic boot kick + upward booster whoosh
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(160, now);
+      osc.frequency.exponentialRampToValueAtTime(520, now + 0.14);
+      gain.gain.setValueAtTime(vol, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.16);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.17);
+    } catch {}
+  }
+
+  public playRopeAttach(detach = false) {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    try {
+      const now = ctx.currentTime;
+      const vol = this.masterVolume * 0.36;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = detach ? 'sine' : 'sawtooth';
+      if (detach) {
+        osc.frequency.setValueAtTime(640, now);
+        osc.frequency.exponentialRampToValueAtTime(980, now + 0.11);
+      } else {
+        // Magnetic grapple winch latch + cable tension zip
+        osc.frequency.setValueAtTime(340, now);
+        osc.frequency.exponentialRampToValueAtTime(1180, now + 0.15);
+      }
+      gain.gain.setValueAtTime(vol, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.17);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.18);
+    } catch {}
+  }
+
+  public playJumpPad() {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    try {
+      const now = ctx.currentTime;
+      const vol = this.masterVolume * 0.42;
+      [220, 440, 880].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        const t = now + i * 0.035;
+        osc.frequency.setValueAtTime(freq, t);
+        osc.frequency.exponentialRampToValueAtTime(freq * 1.85, t + 0.22);
+        gain.gain.setValueAtTime(vol * (1 - i * 0.22), t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.24);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(t);
+        osc.stop(t + 0.25);
+      });
+    } catch {}
+  }
+
   public playBuySound() {
     const ctx = this.ensureContext();
     if (!ctx) return;

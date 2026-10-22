@@ -267,6 +267,7 @@ export default function App() {
           hud={hud}
           crosshairColor={settings.crosshairColor}
           showMinimap={settings.showMinimap}
+          showFps={Boolean(settings.showFps)}
           muted={settings.muted}
           onToggleMute={() => handleUpdateSettings({ muted: !settings.muted })}
           onOpenBuyMenu={() => {
@@ -287,6 +288,7 @@ export default function App() {
           onEquipWeapon={(wid) => engineApiRef.current?.equipWeapon(wid)}
           onDeployNow={() => engineApiRef.current?.skipBuyPhase()}
           onInteractObjective={() => engineApiRef.current?.interactObjective()}
+          onTriggerRopeSwing={() => engineApiRef.current?.triggerRopeSwing()}
           onPracticeAction={(action) => engineApiRef.current?.practiceAction(action)}
         />
       )}
