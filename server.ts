@@ -271,6 +271,24 @@ async function startServer() {
     res.json({ ok: true, room, serverTime: Date.now() });
   });
 
+  app.post('/api/multiplayer/leave', (req, res) => {
+    const { code, playerId } = req.body || {};
+    const norm = normalizeRoomCode(String(code || ''));
+    const room = roomManager.getRoom(norm);
+    if (room) {
+      if (playerId && room.guest && room.guest.playerId === playerId) {
+        room.guest = null;
+        room.status = 'waiting';
+        room.updatedAt = Date.now();
+      } else if (playerId && room.host.playerId === playerId) {
+        room.status = 'abandoned';
+        room.updatedAt = Date.now();
+      }
+      broadcastRoomSync(room);
+    }
+    res.json({ ok: true });
+  });
+
   // ==========================================================================
   // WEBSOCKET SERVER (/ws/match) FOR REAL-TIME 1V1 COMBAT & STATE SYNC
   // ==========================================================================

@@ -204,5 +204,23 @@ export default function handler(req, res) {
     return;
   }
 
+  if (req.method === 'POST' && pathname.endsWith('/api/multiplayer/leave')) {
+    const { code, playerId } = body;
+    const norm = normalizeRoomCode(String(code || ''));
+    const room = roomManager.getRoom(norm);
+    if (room) {
+      if (playerId && room.guest && room.guest.playerId === playerId) {
+        room.guest = null;
+        room.status = 'waiting';
+        room.updatedAt = now;
+      } else if (playerId && room.host.playerId === playerId) {
+        room.status = 'abandoned';
+        room.updatedAt = now;
+      }
+    }
+    res.status(200).json({ ok: true });
+    return;
+  }
+
   res.status(404).json({ ok: false, error: 'Endpoint not found.' });
 }

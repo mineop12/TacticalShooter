@@ -18,6 +18,7 @@ import {
   PublicRoomSummary,
   quickMatchClient,
   setCustomServerUrl,
+  subscribeLocalMultiplayerEvents,
 } from '../game/multiplayerClient';
 import { OperativeId } from '../game/types';
 import { OPERATIVES } from '../game/weapons';
@@ -82,6 +83,21 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
     if (!hostedRoom) return;
     let active = true;
     ensureHostRoomPublished(hostedRoom);
+
+    // Instant in-memory and WebRTC event listener for 0ms reaction time
+    const unsubscribe = subscribeLocalMultiplayerEvents((msg) => {
+      if (!active || !msg) return;
+      if (msg.type === 'mp:room_sync' && msg.room) {
+        const r = msg.room as MultiplayerRoomState;
+        if (normalizeRoomCode(r.code) === normalizeRoomCode(hostedRoom.code)) {
+          setHostedRoom(r);
+          if (r.guest) {
+            onLaunchMultiplayerMatch(r, 'host', callsign);
+          }
+        }
+      }
+    });
+
     const pollRoom = async () => {
       try {
         ensureHostRoomPublished(hostedRoom);
@@ -93,9 +109,11 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
         }
       } catch {}
     };
+
     const interval = window.setInterval(pollRoom, 650);
     return () => {
       active = false;
+      unsubscribe();
       window.clearInterval(interval);
     };
   }, [hostedRoom, callsign, onLaunchMultiplayerMatch]);
@@ -130,6 +148,10 @@ export const MultiplayerModal: React.FC<MultiplayerModalProps> = ({
     const norm = normalizeRoomCode(rawCode);
     if (!isValidRoomCode(norm)) {
       setErrorMsg('Enter a valid 6-character room code (e.g. 7K9X2M).');
+      return;
+    }
+    if (hostedRoom && normalizeRoomCode(hostedRoom.code) === norm) {
+      setErrorMsg(`You are already hosting room ${norm}. Share this code with your challenger.`);
       return;
     }
     setErrorMsg(null);

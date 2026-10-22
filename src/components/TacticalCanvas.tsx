@@ -16,6 +16,7 @@ import {
 } from '../game/multiplayer';
 import {
   createMultiplayerConnection,
+  leaveMultiplayerRoomClient,
   MultiplayerConnectionHandle,
 } from '../game/multiplayerClient';
 import {
@@ -1380,6 +1381,17 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       sim.isSliding = false;
       sim.slideTimer = 0;
       sim.slideCooldown = 0;
+      sim.isWallRunning = false;
+      sim.wallRunSide = null;
+      sim.wallRunTimer = 0;
+      sim.wallRunCooldown = 0;
+      sim.activeWallContact = null;
+      sim.isSwinging = false;
+      sim.activeRopeAnchor = null;
+      sim.ropeCooldown = 0;
+      ropeTetherLine.visible = false;
+      sim.jumpPadCooldown = 0;
+      sim.isGrounded = true;
       sim.cameraRoll = 0;
       sim.playerHealth = 100;
       sim.isReloading = false;
@@ -1391,6 +1403,9 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       sim.gunKickZ = 0;
       sim.gunKickPitch = 0;
       sim.gunKickRoll = 0;
+      sim.shellTimer = 0;
+      fpWeaponRig.shellMesh.visible = false;
+      sim.fireCooldown = 0;
 
       if (isFirstRound || !survivedLastRound) {
         sim.ownedWeapons = createInitialInventory();
@@ -1420,8 +1435,10 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
 
       const prevRound = sim.roundNumber;
       const prevPhase = sim.roundPhase;
+      const opponentJustJoined = !sim.opponentConnected && Boolean(oppState && oppState.connected);
       const isNewBuyRound =
         forceSpawnReset ||
+        opponentJustJoined ||
         room.roundNumber !== prevRound ||
         (room.roundPhase === 'buy' && prevPhase !== 'buy');
 
@@ -1440,6 +1457,13 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             }
           : entry
       );
+
+      // If room was restarted for rematch after gameover, restore playing state cleanly
+      if (room.status === 'active' && sim.appState === 'gameover') {
+        sim.appState = 'playing';
+        sim.matchSummary = null;
+        syncBodyDataset('playing');
+      }
 
       if (myState) {
         if (isNewBuyRound) {
@@ -1725,6 +1749,9 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       },
 
       returnToTitle: () => {
+        if (sim.isMultiplayer && sim.multiplayerRoomCode) {
+          leaveMultiplayerRoomClient(sim.multiplayerRoomCode, sim.multiplayerPlayerId);
+        }
         closeMultiplayerSocket();
         sim.isMultiplayer = false;
         sim.multiplayerRoomCode = null;
@@ -1765,6 +1792,25 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         sim.equipTimer = sim.equipDuration;
         fpWeaponRig.setActiveWeapon(weaponId);
         soundEngine.playBuySound();
+        if (sim.isMultiplayer) {
+          sendMultiplayerMessage({
+            type: 'mp:state',
+            x: sim.playerX,
+            y: sim.playerY,
+            z: sim.playerZ,
+            vx: sim.playerVx,
+            vz: sim.playerVz,
+            yaw: sim.playerYaw,
+            pitch: sim.playerPitch,
+            weaponId: sim.activeWeaponId,
+            armor: sim.playerArmor,
+            armorType: sim.playerArmorType,
+            credits: sim.playerCredits,
+            isCrouching: false,
+            isSliding: sim.isSliding,
+            isReloading: sim.isReloading,
+          });
+        }
         emitHudSnapshot();
         return true;
       },
@@ -1781,6 +1827,25 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         sim.playerArmor = ARMOR_SPECS[armorType].points;
         sim.playerArmorType = armorType;
         soundEngine.playBuySound();
+        if (sim.isMultiplayer) {
+          sendMultiplayerMessage({
+            type: 'mp:state',
+            x: sim.playerX,
+            y: sim.playerY,
+            z: sim.playerZ,
+            vx: sim.playerVx,
+            vz: sim.playerVz,
+            yaw: sim.playerYaw,
+            pitch: sim.playerPitch,
+            weaponId: sim.activeWeaponId,
+            armor: sim.playerArmor,
+            armorType: sim.playerArmorType,
+            credits: sim.playerCredits,
+            isCrouching: false,
+            isSliding: sim.isSliding,
+            isReloading: sim.isReloading,
+          });
+        }
         emitHudSnapshot();
         return true;
       },
@@ -1794,6 +1859,25 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           sim.equipTimer = sim.equipDuration;
           fpWeaponRig.setActiveWeapon(weaponId);
           soundEngine.playWeaponEquip();
+          if (sim.isMultiplayer) {
+            sendMultiplayerMessage({
+              type: 'mp:state',
+              x: sim.playerX,
+              y: sim.playerY,
+              z: sim.playerZ,
+              vx: sim.playerVx,
+              vz: sim.playerVz,
+              yaw: sim.playerYaw,
+              pitch: sim.playerPitch,
+              weaponId: sim.activeWeaponId,
+              armor: sim.playerArmor,
+              armorType: sim.playerArmorType,
+              credits: sim.playerCredits,
+              isCrouching: false,
+              isSliding: sim.isSliding,
+              isReloading: sim.isReloading,
+            });
+          }
           emitHudSnapshot();
         }
       },
@@ -1957,8 +2041,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       } else if (e.code === 'Digit5' && sim.ownedWeapons.sniper) {
         api.equipWeapon('sniper');
       } else if (e.code === 'KeyF') {
-        // Quick-aim & fire assist for keyboard-only accessibility
-        if (sim.aiHealth > 0) {
+        // Quick-aim & fire assist for keyboard-only accessibility (offline singleplayer only)
+        if (!sim.isMultiplayer && sim.aiHealth > 0) {
           if (
             !hasLineOfSight(
               sim.playerX,
@@ -3194,13 +3278,14 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             const distToPlayer = Math.max(0.1, Math.hypot(toPlayerX, toPlayerZ));
 
             // 1. Line of Sight Check (AI eyes to Player eyes — strictly blocked by walls!)
-            const aiEyeY = 1.58 - sim.aiCrouchOffset;
+            const aiEyeY = sim.aiY + 1.58 - sim.aiCrouchOffset;
+            const playerEyeY = sim.playerY + currentEyeY;
             const losClear = hasLineOfSight(
               sim.aiX,
               aiEyeY,
               sim.aiZ,
               sim.playerX,
-              currentEyeY,
+              playerEyeY,
               sim.playerZ,
               arena.obstacles
             );

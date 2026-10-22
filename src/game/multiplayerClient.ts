@@ -8,6 +8,7 @@ import {
 } from './multiplayer.ts';
 import { OperativeId, WeaponId } from './types.ts';
 import {
+  closeAllOtherWebRtcChannels,
   discoverWebRtcPublicRooms,
   getActiveWebRtcChannel,
   isWebRtcSupported,
@@ -34,6 +35,17 @@ const BROADCAST_CHANNEL_NAME = 'vanguard_mp_channel_v1';
 // Shared in-browser room authority for static-host fallback & cross-tab play
 const localRoomManager = new MultiplayerRoomManager();
 let lastDetectedTransportMode: TransportMode = isWebRtcSupported() ? 'webrtc' : 'server';
+
+// In-memory pub/sub listener set for zero-latency same-tab updates
+type LocalEventListener = (event: Record<string, unknown>) => void;
+const localEventListeners = new Set<LocalEventListener>();
+
+export function subscribeLocalMultiplayerEvents(listener: LocalEventListener): () => void {
+  localEventListeners.add(listener);
+  return () => {
+    localEventListeners.delete(listener);
+  };
+}
 
 export function getDetectedTransportMode(): TransportMode {
   return lastDetectedTransportMode;
@@ -84,8 +96,22 @@ function persistLocalRoomsToStorage(): void {
   } catch {}
 }
 
-function emitBroadcastEvent(payload: Record<string, unknown>): void {
+/**
+ * Distribute an event across local components, tabs, and optional storage listeners.
+ * CRITICAL: To prevent 22Hz disk-thrashing and storage event storms, high-frequency
+ * telemetry events (mp:state, mp:ping) are NEVER written to localStorage.
+ */
+function emitBroadcastEvent(payload: Record<string, unknown>, writeToLocalStorage = false): void {
+  // 1. Same-process in-memory listeners
+  for (const listener of localEventListeners) {
+    try {
+      listener(payload);
+    } catch {}
+  }
+
   if (typeof window === 'undefined') return;
+
+  // 2. Cross-tab BroadcastChannel
   try {
     if (typeof BroadcastChannel !== 'undefined') {
       const bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
@@ -93,14 +119,18 @@ function emitBroadcastEvent(payload: Record<string, unknown>): void {
       bc.close();
     }
   } catch {}
-  try {
-    if (window.localStorage) {
-      window.localStorage.setItem(
-        STORAGE_EVENT_KEY,
-        JSON.stringify({ ...payload, _nonce: Math.random(), _ts: Date.now() })
-      );
-    }
-  } catch {}
+
+  // 3. Fallback localStorage event trigger ONLY for structural room events
+  if (writeToLocalStorage) {
+    try {
+      if (window.localStorage) {
+        window.localStorage.setItem(
+          STORAGE_EVENT_KEY,
+          JSON.stringify({ ...payload, _nonce: Math.random(), _ts: Date.now() })
+        );
+      }
+    } catch {}
+  }
 }
 
 function resolveApiUrl(path: string): string {
@@ -159,7 +189,6 @@ async function safeFetchJson<T = Record<string, unknown>>(
     }
     const data = JSON.parse(text) as T;
     if (!res.ok) {
-      // Only mark server API unavailable if a non-JSON 405/404 occurred on a root endpoint
       if (res.status === 405) {
         serverApiAvailable = false;
       }
@@ -192,7 +221,7 @@ export function ensureHostRoomPublished(room: MultiplayerRoomState): WebRtcChann
   if (!isWebRtcSupported()) return null;
   const code = normalizeRoomCode(room.code);
   const existing = getActiveWebRtcChannel(code);
-  if (existing && existing.role === 'host' && existing.isSignalingReady()) {
+  if (existing && existing.role === 'host' && !existing.isClosed()) {
     return existing;
   }
 
@@ -225,17 +254,20 @@ export function ensureHostRoomPublished(room: MultiplayerRoomState): WebRtcChann
         });
         if (joinRes.ok) {
           persistLocalRoomsToStorage();
-          emitBroadcastEvent({
-            type: 'mp:room_sync',
-            room: joinRes.room,
-            serverTime: Date.now(),
-          });
+          emitBroadcastEvent(
+            {
+              type: 'mp:room_sync',
+              room: joinRes.room,
+              serverTime: Date.now(),
+            },
+            true
+          );
           return { ok: true, room: joinRes.room };
         }
         return { ok: false, error: joinRes.error };
       },
       onMessage: (msg) => {
-        emitBroadcastEvent(msg);
+        emitBroadcastEvent(msg, msg.type === 'mp:room_sync' || msg.type === 'mp:damage');
       },
     });
     if (lastDetectedTransportMode === 'local-mesh') {
@@ -353,6 +385,9 @@ export async function createRoomClient(params: {
   });
   persistLocalRoomsToStorage();
 
+  // Close any obsolete WebRTC channels for other codes
+  closeAllOtherWebRtcChannels(room.code);
+
   // 2. Also register room with backend / Vercel serverless API if available
   try {
     const resp = await safeFetchJson<{
@@ -387,11 +422,14 @@ export async function createRoomClient(params: {
     lastDetectedTransportMode = isWebRtcSupported() ? 'webrtc' : 'local-mesh';
   }
 
-  emitBroadcastEvent({
-    type: 'mp:room_sync',
-    room,
-    serverTime: Date.now(),
-  });
+  emitBroadcastEvent(
+    {
+      type: 'mp:room_sync',
+      room,
+      serverTime: Date.now(),
+    },
+    true
+  );
 
   return {
     ok: true,
@@ -427,7 +465,12 @@ export async function joinRoomByCodeClient(params: {
 
   // 1. Check cross-tab / local room registry first (instant for same-browser testing)
   const localRoom = localRoomManager.getRoom(norm);
-  if (localRoom && (localRoom.guest === null || localRoom.guest.playerId === params.playerId || localRoom.host.playerId === params.playerId)) {
+  if (
+    localRoom &&
+    (localRoom.guest === null ||
+      localRoom.guest.playerId === params.playerId ||
+      localRoom.host.playerId === params.playerId)
+  ) {
     const localJoin = localRoomManager.joinRoomByCode({
       code: norm,
       playerId: params.playerId,
@@ -436,12 +479,15 @@ export async function joinRoomByCodeClient(params: {
     });
     if (localJoin.ok) {
       persistLocalRoomsToStorage();
-      emitBroadcastEvent({
-        type: 'mp:room_sync',
-        room: localJoin.room,
-        serverTime: Date.now(),
-      });
-      // Also notify server if available
+      emitBroadcastEvent(
+        {
+          type: 'mp:room_sync',
+          room: localJoin.room,
+          serverTime: Date.now(),
+        },
+        true
+      );
+      // Also notify server if available in background
       safeFetchJson('/api/multiplayer/join', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -456,8 +502,57 @@ export async function joinRoomByCodeClient(params: {
     }
   }
 
-  // 2. Try direct WebRTC P2P connection AND server API
-  // On Vercel (where serverless instances may not share memory), prioritize WebRTC P2P handshake first or in parallel
+  // 2. Prioritize direct WebRTC P2P connection when WebRTC is supported
+  // This handshakes directly with the host browser, exchanging live room state without server race conditions
+  let webrtcError: string | null = null;
+  if (isWebRtcSupported()) {
+    try {
+      const webrtcJoin = await joinWebRtcHost({
+        roomCode: norm,
+        playerId: params.playerId,
+        callsign: params.callsign,
+        operative: params.operative,
+        onMessage: (msg) => {
+          emitBroadcastEvent(msg, msg.type === 'mp:room_sync' || msg.type === 'mp:damage');
+        },
+        timeoutMs: 6500,
+      });
+
+      if (webrtcJoin.ok) {
+        lastDetectedTransportMode = 'webrtc';
+        localRoomManager.upsertRoom(webrtcJoin.room);
+        persistLocalRoomsToStorage();
+        emitBroadcastEvent(
+          {
+            type: 'mp:room_sync',
+            room: webrtcJoin.room,
+            serverTime: Date.now(),
+          },
+          true
+        );
+
+        // Notify server backend asynchronously in the background so REST room query stays aligned
+        safeFetchJson('/api/multiplayer/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...params, code: norm }),
+        }).catch(() => {});
+
+        return {
+          ok: true,
+          room: webrtcJoin.room,
+          role: webrtcJoin.role,
+          transportMode: 'webrtc',
+        };
+      } else {
+        webrtcError = webrtcJoin.error;
+      }
+    } catch (e) {
+      webrtcError = e instanceof Error ? e.message : null;
+    }
+  }
+
+  // 3. Fallback to server REST API join if WebRTC was not supported or failed
   let serverRoomResult: { room: MultiplayerRoomState; role: MultiplayerRole } | null = null;
   let explicitError: string | null = null;
 
@@ -483,53 +578,18 @@ export async function joinRoomByCodeClient(params: {
     }
   } catch {}
 
-  // Attempt direct WebRTC P2P connection to the Host's room code so direct P2P channel is established
-  let webrtcError: string | null = null;
-  if (isWebRtcSupported() && (!serverRoomResult || isVercelHost())) {
-    try {
-      const webrtcJoin = await joinWebRtcHost({
-        roomCode: norm,
-        playerId: params.playerId,
-        callsign: params.callsign,
-        operative: params.operative,
-        onMessage: (msg) => {
-          emitBroadcastEvent(msg);
-        },
-        timeoutMs: serverRoomResult ? 3500 : 8500,
-      });
-
-      if (webrtcJoin.ok) {
-        lastDetectedTransportMode = 'webrtc';
-        localRoomManager.upsertRoom(webrtcJoin.room);
-        persistLocalRoomsToStorage();
-        emitBroadcastEvent({
-          type: 'mp:room_sync',
-          room: webrtcJoin.room,
-          serverTime: Date.now(),
-        });
-        return {
-          ok: true,
-          room: webrtcJoin.room,
-          role: webrtcJoin.role,
-          transportMode: 'webrtc',
-        };
-      } else {
-        webrtcError = webrtcJoin.error;
-      }
-    } catch (e) {
-      webrtcError = e instanceof Error ? e.message : null;
-    }
-  }
-
   if (serverRoomResult) {
     lastDetectedTransportMode = 'server';
     localRoomManager.upsertRoom(serverRoomResult.room);
     persistLocalRoomsToStorage();
-    emitBroadcastEvent({
-      type: 'mp:room_sync',
-      room: serverRoomResult.room,
-      serverTime: Date.now(),
-    });
+    emitBroadcastEvent(
+      {
+        type: 'mp:room_sync',
+        room: serverRoomResult.room,
+        serverTime: Date.now(),
+      },
+      true
+    );
     return {
       ok: true,
       room: serverRoomResult.room,
@@ -616,17 +676,20 @@ export async function quickMatchClient(params: {
         playerId: params.playerId,
         callsign: params.callsign,
         operative: params.operative,
-        onMessage: (msg) => emitBroadcastEvent(msg),
+        onMessage: (msg) => emitBroadcastEvent(msg, msg.type === 'mp:room_sync' || msg.type === 'mp:damage'),
         timeoutMs: 4000,
       }).catch(() => {});
     }
 
     lastDetectedTransportMode = isVercelHost() && isWebRtcSupported() ? 'webrtc' : 'server';
-    emitBroadcastEvent({
-      type: 'mp:room_sync',
-      room,
-      serverTime: Date.now(),
-    });
+    emitBroadcastEvent(
+      {
+        type: 'mp:room_sync',
+        room,
+        serverTime: Date.now(),
+      },
+      true
+    );
     return {
       ok: true,
       room,
@@ -652,11 +715,14 @@ export async function quickMatchClient(params: {
   }
 
   lastDetectedTransportMode = isWebRtcSupported() ? 'webrtc' : 'local-mesh';
-  emitBroadcastEvent({
-    type: 'mp:room_sync',
-    room: result.room,
-    serverTime: Date.now(),
-  });
+  emitBroadcastEvent(
+    {
+      type: 'mp:room_sync',
+      room: result.room,
+      serverTime: Date.now(),
+    },
+    true
+  );
 
   return {
     ok: true,
@@ -688,11 +754,14 @@ export async function fillWithSimulatedChallengerClient(
 
   if (localJoin.ok) {
     persistLocalRoomsToStorage();
-    emitBroadcastEvent({
-      type: 'mp:room_sync',
-      room: localJoin.room,
-      serverTime: Date.now(),
-    });
+    emitBroadcastEvent(
+      {
+        type: 'mp:room_sync',
+        room: localJoin.room,
+        serverTime: Date.now(),
+      },
+      true
+    );
     return localJoin.room;
   }
 
@@ -707,6 +776,40 @@ export async function fillWithSimulatedChallengerClient(
     return joined.room;
   }
   return null;
+}
+
+export function leaveMultiplayerRoomClient(code: string, playerId?: string): void {
+  const norm = normalizeRoomCode(code);
+  const activeRtc = getActiveWebRtcChannel(norm);
+  if (activeRtc) {
+    try {
+      activeRtc.send({ type: 'mp:player_left', code: norm, playerId });
+    } catch {}
+    activeRtc.close();
+  }
+
+  // Notify backend API if reachable
+  safeFetchJson('/api/multiplayer/leave', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: norm, playerId }),
+  }).catch(() => {});
+
+  hydrateLocalRoomsFromStorage();
+  const room = localRoomManager.getRoom(norm);
+  if (room) {
+    if (playerId && room.guest && room.guest.playerId === playerId) {
+      room.guest = null;
+      room.status = 'waiting';
+      room.updatedAt = Date.now();
+    } else if (playerId && room.host.playerId === playerId) {
+      room.status = 'abandoned';
+      room.updatedAt = Date.now();
+    }
+    persistLocalRoomsToStorage();
+  }
+
+  emitBroadcastEvent({ type: 'mp:player_left', code: norm, playerId }, true);
 }
 
 export interface MultiplayerConnectionHandle {
@@ -731,6 +834,11 @@ export function createMultiplayerConnection(options: {
   let authorityTickTimer: number | null = null;
   let httpPollTimer: number | null = null;
   let reconnectTimer: number | null = null;
+  let unsubscribeLocalEvents: (() => void) | null = null;
+
+  // Deduplication sets to prevent processing identical hits or damage events multiple times
+  const seenDamageEventIds = new Set<string>();
+  const seenHitEventIds = new Set<string>();
 
   hydrateLocalRoomsFromStorage();
 
@@ -752,13 +860,34 @@ export function createMultiplayerConnection(options: {
     return false;
   };
 
-  // Handle incoming messages arriving from the remote peer over WebRTC DataChannel
+  // Handle incoming messages arriving from remote peer or local event bus
   const handleIncomingPeerMessage = (msg: Record<string, unknown>) => {
     if (closed || !msg || typeof msg.type !== 'string') return;
 
     if (msg.type === 'mp:room_sync' && msg.room) {
-      localRoomManager.upsertRoom(msg.room as MultiplayerRoomState);
-      persistLocalRoomsToStorage();
+      const r = msg.room as MultiplayerRoomState;
+      if (normalizeRoomCode(r.code) === code) {
+        localRoomManager.upsertRoom(r);
+        deliver(msg);
+      }
+      return;
+    }
+
+    if (msg.type === 'mp:damage' && msg.event) {
+      const ev = msg.event as DamageResolutionEvent;
+      if (ev.eventId && seenDamageEventIds.has(ev.eventId)) {
+        return; // Idempotent deduplication: already resolved
+      }
+      if (ev.eventId) {
+        seenDamageEventIds.add(ev.eventId);
+        if (seenDamageEventIds.size > 200) {
+          const first = seenDamageEventIds.values().next().value;
+          if (first) seenDamageEventIds.delete(first);
+        }
+      }
+      if (msg.room) {
+        localRoomManager.upsertRoom(msg.room as MultiplayerRoomState);
+      }
       deliver(msg);
       return;
     }
@@ -766,18 +895,17 @@ export function createMultiplayerConnection(options: {
     if (
       msg.type === 'mp:remote_state' ||
       msg.type === 'mp:remote_shoot' ||
-      msg.type === 'mp:damage' ||
-      msg.type === 'mp:pong'
+      msg.type === 'mp:pong' ||
+      msg.type === 'mp:player_left'
     ) {
       if (msg.room) {
         localRoomManager.upsertRoom(msg.room as MultiplayerRoomState);
-        persistLocalRoomsToStorage();
       }
       deliver(msg);
       return;
     }
 
-    // If remote Guest sent raw action (mp:hit, mp:deploy_now, mp:rematch, mp:state, mp:shoot) to Host over WebRTC:
+    // Direct action routed from remote Guest to authoritative Host:
     const senderRole: MultiplayerRole =
       msg.role === 'host' || msg.role === 'guest'
         ? msg.role
@@ -803,7 +931,6 @@ export function createMultiplayerConnection(options: {
         isReloading: Boolean(msg.isReloading),
       });
       if (updated) {
-        persistLocalRoomsToStorage();
         deliver({
           type: 'mp:remote_state',
           code,
@@ -832,6 +959,16 @@ export function createMultiplayerConnection(options: {
     }
 
     if (msg.type === 'mp:hit' && role === 'host') {
+      const hitId = typeof msg.eventId === 'string' ? msg.eventId : `${senderRole}_${Date.now()}`;
+      if (seenHitEventIds.has(hitId)) {
+        return;
+      }
+      seenHitEventIds.add(hitId);
+      if (seenHitEventIds.size > 200) {
+        const first = seenHitEventIds.values().next().value;
+        if (first) seenHitEventIds.delete(first);
+      }
+
       const dmgEvent: DamageResolutionEvent | null = localRoomManager.applyHitDamage({
         code,
         attackerRole: senderRole,
@@ -855,7 +992,7 @@ export function createMultiplayerConnection(options: {
         };
         deliver(dmgMsg);
         sendOverWebRtc(dmgMsg);
-        emitBroadcastEvent(dmgMsg);
+        emitBroadcastEvent(dmgMsg, true);
       }
       return;
     }
@@ -871,7 +1008,7 @@ export function createMultiplayerConnection(options: {
         const syncMsg = { type: 'mp:room_sync', code, room, serverTime: Date.now() };
         deliver(syncMsg);
         sendOverWebRtc(syncMsg);
-        emitBroadcastEvent(syncMsg);
+        emitBroadcastEvent(syncMsg, true);
       }
       return;
     }
@@ -884,19 +1021,32 @@ export function createMultiplayerConnection(options: {
         const syncMsg = { type: 'mp:room_sync', code, room, serverTime: Date.now() };
         deliver(syncMsg);
         sendOverWebRtc(syncMsg);
-        emitBroadcastEvent(syncMsg);
+        emitBroadcastEvent(syncMsg, true);
       }
       return;
     }
   };
 
-  // Register direct WebRTC message handler if channel is active
+  // Register direct WebRTC/WSS message handler if channel is active (or publish if host)
+  if (role === 'host') {
+    const currentRoom = localRoomManager.getRoom(code);
+    if (currentRoom) {
+      ensureHostRoomPublished(currentRoom);
+    }
+  }
   const activeRtc = getActiveWebRtcChannel(code);
   if (activeRtc) {
     activeRtc.setMessageHandler(handleIncomingPeerMessage);
   }
 
-  // 1. Setup Cross-Tab BroadcastChannel + Storage Event Listener
+  // 1. Subscribe to same-tab in-memory event bus
+  unsubscribeLocalEvents = subscribeLocalMultiplayerEvents((msg) => {
+    if (closed || !msg) return;
+    if (msg.code && normalizeRoomCode(String(msg.code)) !== code) return;
+    handleIncomingPeerMessage(msg);
+  });
+
+  // 2. Setup Cross-Tab BroadcastChannel + Storage Event Listener
   if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
     try {
       bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
@@ -938,150 +1088,7 @@ export function createMultiplayerConnection(options: {
     window.addEventListener('storage', onStorageEvent);
   }
 
-  // Process outbound message in local/WebRTC room manager
-  const processMessageLocallyAndWebRtc = (payload: Record<string, unknown>) => {
-    hydrateLocalRoomsFromStorage();
-    const type = String(payload.type || '');
-    const webrtc = getActiveWebRtcChannel(code);
-    const rtcConnected = Boolean(webrtc && webrtc.isConnected());
-
-    if (type === 'mp:ping') {
-      if (rtcConnected) {
-        sendOverWebRtc({ type: 'mp:ping', clientSentAt: payload.clientSentAt });
-      } else {
-        deliver({
-          type: 'mp:pong',
-          clientSentAt: payload.clientSentAt,
-          serverTime: Date.now(),
-        });
-      }
-      return;
-    }
-
-    if (type === 'mp:state') {
-      const updated = localRoomManager.updatePlayerTelemetry(code, role, {
-        x: payload.x as number,
-        y: payload.y as number,
-        z: payload.z as number,
-        vx: payload.vx as number,
-        vz: payload.vz as number,
-        yaw: payload.yaw as number,
-        pitch: payload.pitch as number,
-        weaponId: payload.weaponId as WeaponId,
-        armor: payload.armor as number,
-        armorType: payload.armorType as 'none' | 'light' | 'heavy',
-        credits: payload.credits as number,
-        isCrouching: Boolean(payload.isCrouching),
-        isSliding: Boolean(payload.isSliding),
-        isReloading: Boolean(payload.isReloading),
-      });
-      if (updated) {
-        persistLocalRoomsToStorage();
-        const remoteStateMsg = {
-          type: 'mp:remote_state',
-          code,
-          role,
-          player: updated,
-          serverTime: Date.now(),
-        };
-        sendOverWebRtc(remoteStateMsg);
-        emitBroadcastEvent(remoteStateMsg);
-      }
-      return;
-    }
-
-    if (type === 'mp:shoot') {
-      const remoteShootMsg = {
-        type: 'mp:remote_shoot',
-        code,
-        role,
-        weaponId: payload.weaponId,
-        originX: payload.originX,
-        originY: payload.originY,
-        originZ: payload.originZ,
-        endX: payload.endX,
-        endY: payload.endY,
-        endZ: payload.endZ,
-      };
-      sendOverWebRtc(remoteShootMsg);
-      emitBroadcastEvent(remoteShootMsg);
-      return;
-    }
-
-    if (type === 'mp:hit') {
-      if (rtcConnected && role === 'guest') {
-        // Guest forwards hit event to authoritative Host over WebRTC
-        sendOverWebRtc({ ...payload, code, role });
-        return;
-      }
-
-      const dmgEvent: DamageResolutionEvent | null = localRoomManager.applyHitDamage({
-        code,
-        attackerRole: role,
-        weaponId: (payload.weaponId as WeaponId) || 'pistol',
-        rawDamage: Number(payload.rawDamage) || 26,
-        isHeadshot: Boolean(payload.isHeadshot),
-        distance: Number(payload.distance) || 10,
-        hitX: Number(payload.hitX) || 0,
-        hitY: Number(payload.hitY) || 1,
-        hitZ: Number(payload.hitZ) || 0,
-      });
-      const room = localRoomManager.getRoom(code);
-      if (dmgEvent && room) {
-        persistLocalRoomsToStorage();
-        const dmgMsg = {
-          type: 'mp:damage',
-          code,
-          event: dmgEvent,
-          room,
-          serverTime: Date.now(),
-        };
-        deliver(dmgMsg);
-        sendOverWebRtc(dmgMsg);
-        emitBroadcastEvent(dmgMsg);
-      }
-      return;
-    }
-
-    if (type === 'mp:deploy_now') {
-      if (rtcConnected && role === 'guest') {
-        sendOverWebRtc({ type: 'mp:deploy_now', code, role });
-        return;
-      }
-      const room = localRoomManager.getRoom(code);
-      if (room && room.roundPhase === 'buy') {
-        room.roundPhase = 'combat';
-        room.phaseEndsAt = Date.now() + 95_000;
-        room.announcement = 'COMBAT LIVE // ELIMINATE RIVAL OPERATIVE';
-        room.updatedAt = Date.now();
-        persistLocalRoomsToStorage();
-        const syncMsg = { type: 'mp:room_sync', code, room, serverTime: Date.now() };
-        deliver(syncMsg);
-        sendOverWebRtc(syncMsg);
-        emitBroadcastEvent(syncMsg);
-      }
-      return;
-    }
-
-    if (type === 'mp:rematch') {
-      if (rtcConnected && role === 'guest') {
-        sendOverWebRtc({ type: 'mp:rematch', code, role });
-        return;
-      }
-      const room = localRoomManager.getRoom(code);
-      if (room) {
-        localRoomManager.startMatchInRoom(room, Date.now());
-        persistLocalRoomsToStorage();
-        const syncMsg = { type: 'mp:room_sync', code, room, serverTime: Date.now() };
-        deliver(syncMsg);
-        sendOverWebRtc(syncMsg);
-        emitBroadcastEvent(syncMsg);
-      }
-      return;
-    }
-  };
-
-  // 2. Connect WebSocket to Backend Server (when available and not on static Vercel host)
+  // 3. Connect WebSocket to Backend Server (when available and not on static Vercel host)
   const connectWs = () => {
     if (
       closed ||
@@ -1137,7 +1144,6 @@ export function createMultiplayerConnection(options: {
           if (!msg || typeof msg.type !== 'string') return;
           if (msg.room) {
             localRoomManager.upsertRoom(msg.room as MultiplayerRoomState);
-            persistLocalRoomsToStorage();
           }
           deliver(msg);
         } catch {}
@@ -1160,7 +1166,7 @@ export function createMultiplayerConnection(options: {
 
   connectWs();
 
-  // 3. Emit initial room sync immediately from local cache so HUD is populated without waiting
+  // 4. Emit initial room sync immediately from local cache so HUD is populated without waiting
   const initialRoom = localRoomManager.getRoom(code);
   if (initialRoom) {
     window.setTimeout(() => {
@@ -1170,7 +1176,7 @@ export function createMultiplayerConnection(options: {
     }, 20);
   }
 
-  // 4. Ping & Local Authority Timer Loop (ticks round phase transitions and simulated challenger if active)
+  // 5. Ping & Local Authority Timer Loop
   pingTimer = window.setInterval(() => {
     if (closed) return;
     const webrtc = getActiveWebRtcChannel(code);
@@ -1199,7 +1205,6 @@ export function createMultiplayerConnection(options: {
 
   authorityTickTimer = window.setInterval(() => {
     if (closed) return;
-    // Keep WebRTC message handler bound if channel was established
     const currentRtc = getActiveWebRtcChannel(code);
     if (currentRtc) {
       currentRtc.setMessageHandler(handleIncomingPeerMessage);
@@ -1207,7 +1212,6 @@ export function createMultiplayerConnection(options: {
 
     // If WebSocket is not open, Host runs authoritative room phase transitions locally and broadcasts over WebRTC
     if (!wsOpen && role === 'host') {
-      hydrateLocalRoomsFromStorage();
       const transitions = localRoomManager.tickRooms(Date.now());
       for (const tr of transitions) {
         if (normalizeRoomCode(tr.room.code) === code) {
@@ -1220,12 +1224,12 @@ export function createMultiplayerConnection(options: {
           };
           deliver(syncMsg);
           sendOverWebRtc(syncMsg);
-          emitBroadcastEvent(syncMsg);
+          emitBroadcastEvent(syncMsg, true);
         }
       }
     }
 
-    // If the room has a simulated online challenger (`sim_challenger_`), drive its live 1v1 movement & combat
+    // Simulated challenger (`sim_challenger_`) logic
     const room = localRoomManager.getRoom(code);
     if (
       room &&
@@ -1277,7 +1281,6 @@ export function createMultiplayerConnection(options: {
           });
         }
 
-        // Simulated challenger fires periodically during combat when within range
         simBotShotCooldown = Math.max(0, simBotShotCooldown - 0.2);
         const dist = Math.hypot(dx, dz);
         if (room.roundPhase === 'combat' && host.health > 0 && dist < 34 && simBotShotCooldown <= 0) {
@@ -1294,7 +1297,6 @@ export function createMultiplayerConnection(options: {
             endZ: host.z + (Math.random() - 0.5) * 1.4,
           });
 
-          // 28% hit probability when unobstructed in mid-range
           if (Math.random() < 0.28) {
             const spec = WEAPONS[weaponChoice];
             const dmgEv = localRoomManager.applyHitDamage({
@@ -1325,7 +1327,7 @@ export function createMultiplayerConnection(options: {
     }
   }, 200);
 
-  // 5. HTTP Poll Fallback when server REST API is active but WebSocket upgrade was blocked
+  // 6. Polling fallback only when WebSocket and WebRTC are both disconnected
   httpPollTimer = window.setInterval(async () => {
     const webrtc = getActiveWebRtcChannel(code);
     if (closed || wsOpen || (webrtc && webrtc.isConnected()) || serverApiAvailable === false) {
@@ -1352,50 +1354,193 @@ export function createMultiplayerConnection(options: {
         });
       }
     }
-  }, 350);
+  }, 450);
 
   return {
     send: (payload: Record<string, unknown>) => {
       if (closed) return;
+      const type = String(payload.type || '');
+      const webrtc = getActiveWebRtcChannel(code);
+      const rtcConnected = Boolean(webrtc && webrtc.isConnected());
+
+      // If WebSocket is actively open, use it
       if (ws && wsOpen && ws.readyState === WebSocket.OPEN) {
         try {
           ws.send(JSON.stringify(payload));
         } catch {}
-      } else if (serverApiAvailable === true) {
-        safeFetchJson('/api/multiplayer/event', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...payload, code, role, playerId }),
-        })
-          .then((res) => {
-            if (res.ok && res.data && typeof res.data === 'object') {
-              const d = res.data as Record<string, unknown>;
-              if (d.event && d.room) {
-                deliver({
-                  type: 'mp:damage',
-                  event: d.event,
-                  room: d.room,
-                  serverTime: d.serverTime || Date.now(),
-                });
-              } else if (d.room) {
-                deliver({
-                  type: 'mp:room_sync',
-                  room: d.room,
-                  serverTime: d.serverTime || Date.now(),
-                });
-              }
-            }
-          })
-          .catch(() => {});
       }
-      // Always process locally & forward over active WebRTC DataChannel
-      processMessageLocallyAndWebRtc(payload);
+
+      // Handle message types cleanly without spamming REST /api/multiplayer/event
+      if (type === 'mp:ping') {
+        if (rtcConnected) {
+          sendOverWebRtc({ type: 'mp:ping', clientSentAt: payload.clientSentAt });
+        } else if (!wsOpen) {
+          deliver({
+            type: 'mp:pong',
+            clientSentAt: payload.clientSentAt,
+            serverTime: Date.now(),
+          });
+        }
+        return;
+      }
+
+      if (type === 'mp:state') {
+        const updated = localRoomManager.updatePlayerTelemetry(code, role, {
+          x: payload.x as number,
+          y: payload.y as number,
+          z: payload.z as number,
+          vx: payload.vx as number,
+          vz: payload.vz as number,
+          yaw: payload.yaw as number,
+          pitch: payload.pitch as number,
+          weaponId: payload.weaponId as WeaponId,
+          armor: payload.armor as number,
+          armorType: payload.armorType as 'none' | 'light' | 'heavy',
+          credits: payload.credits as number,
+          isCrouching: Boolean(payload.isCrouching),
+          isSliding: Boolean(payload.isSliding),
+          isReloading: Boolean(payload.isReloading),
+        });
+        if (updated) {
+          const remoteStateMsg = {
+            type: 'mp:remote_state',
+            code,
+            role,
+            player: updated,
+            serverTime: Date.now(),
+          };
+          if (rtcConnected) {
+            sendOverWebRtc(remoteStateMsg);
+          }
+          // Broadcast to other tabs/listeners without writing 22Hz to localStorage
+          emitBroadcastEvent(remoteStateMsg, false);
+        }
+        return;
+      }
+
+      if (type === 'mp:shoot') {
+        const remoteShootMsg = {
+          type: 'mp:remote_shoot',
+          code,
+          role,
+          weaponId: payload.weaponId,
+          originX: payload.originX,
+          originY: payload.originY,
+          originZ: payload.originZ,
+          endX: payload.endX,
+          endY: payload.endY,
+          endZ: payload.endZ,
+        };
+        if (rtcConnected) {
+          sendOverWebRtc(remoteShootMsg);
+        }
+        emitBroadcastEvent(remoteShootMsg, false);
+        return;
+      }
+
+      if (type === 'mp:hit') {
+        const hitId =
+          typeof payload.eventId === 'string'
+            ? payload.eventId
+            : `hit_${role}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        const hitPayload = { ...payload, eventId: hitId, code, role };
+
+        if (role === 'guest') {
+          // Guest forwards hit to host authority via WebRTC or BroadcastChannel
+          if (rtcConnected) {
+            sendOverWebRtc(hitPayload);
+          } else {
+            emitBroadcastEvent(hitPayload, true);
+          }
+          return;
+        }
+
+        // Host processes hit
+        if (seenHitEventIds.has(hitId)) return;
+        seenHitEventIds.add(hitId);
+
+        const dmgEvent: DamageResolutionEvent | null = localRoomManager.applyHitDamage({
+          code,
+          attackerRole: role,
+          weaponId: (payload.weaponId as WeaponId) || 'pistol',
+          rawDamage: Number(payload.rawDamage) || 26,
+          isHeadshot: Boolean(payload.isHeadshot),
+          distance: Number(payload.distance) || 10,
+          hitX: Number(payload.hitX) || 0,
+          hitY: Number(payload.hitY) || 1,
+          hitZ: Number(payload.hitZ) || 0,
+        });
+        const room = localRoomManager.getRoom(code);
+        if (dmgEvent && room) {
+          persistLocalRoomsToStorage();
+          const dmgMsg = {
+            type: 'mp:damage',
+            code,
+            event: dmgEvent,
+            room,
+            serverTime: Date.now(),
+          };
+          deliver(dmgMsg);
+          sendOverWebRtc(dmgMsg);
+          emitBroadcastEvent(dmgMsg, true);
+        }
+        return;
+      }
+
+      if (type === 'mp:deploy_now') {
+        if (role === 'guest') {
+          if (rtcConnected) {
+            sendOverWebRtc({ type: 'mp:deploy_now', code, role });
+          } else {
+            emitBroadcastEvent({ type: 'mp:deploy_now', code, role }, true);
+          }
+          return;
+        }
+        const room = localRoomManager.getRoom(code);
+        if (room && room.roundPhase === 'buy') {
+          room.roundPhase = 'combat';
+          room.phaseEndsAt = Date.now() + 95_000;
+          room.announcement = 'COMBAT LIVE // ELIMINATE RIVAL OPERATIVE';
+          room.updatedAt = Date.now();
+          persistLocalRoomsToStorage();
+          const syncMsg = { type: 'mp:room_sync', code, room, serverTime: Date.now() };
+          deliver(syncMsg);
+          sendOverWebRtc(syncMsg);
+          emitBroadcastEvent(syncMsg, true);
+        }
+        return;
+      }
+
+      if (type === 'mp:rematch') {
+        if (role === 'guest') {
+          if (rtcConnected) {
+            sendOverWebRtc({ type: 'mp:rematch', code, role });
+          } else {
+            emitBroadcastEvent({ type: 'mp:rematch', code, role }, true);
+          }
+          return;
+        }
+        const room = localRoomManager.getRoom(code);
+        if (room) {
+          localRoomManager.startMatchInRoom(room, Date.now());
+          persistLocalRoomsToStorage();
+          const syncMsg = { type: 'mp:room_sync', code, room, serverTime: Date.now() };
+          deliver(syncMsg);
+          sendOverWebRtc(syncMsg);
+          emitBroadcastEvent(syncMsg, true);
+        }
+        return;
+      }
     },
     close: () => {
       closed = true;
       const rtc = getActiveWebRtcChannel(code);
       if (rtc) {
         rtc.setMessageHandler(null);
+      }
+      if (unsubscribeLocalEvents) {
+        unsubscribeLocalEvents();
+        unsubscribeLocalEvents = null;
       }
       if (pingTimer !== null) window.clearInterval(pingTimer);
       if (authorityTickTimer !== null) window.clearInterval(authorityTickTimer);

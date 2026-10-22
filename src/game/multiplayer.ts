@@ -10,7 +10,7 @@ import { ARMOR_SPECS, WEAPONS } from './weapons.ts';
 
 export type MultiplayerRole = 'host' | 'guest';
 
-export type RoomStatus = 'waiting' | 'active' | 'finished';
+export type RoomStatus = 'waiting' | 'active' | 'finished' | 'abandoned';
 
 export interface MultiplayerPlayerState {
   playerId: string;
@@ -63,6 +63,7 @@ export interface MultiplayerRoomState {
 }
 
 export interface DamageResolutionEvent {
+  eventId: string;
   attackerRole: MultiplayerRole;
   victimRole: MultiplayerRole;
   weaponId: WeaponId;
@@ -207,6 +208,16 @@ export class MultiplayerRoomManager {
     now?: number;
   }): MultiplayerRoomState {
     const now = params.now ?? Date.now();
+    // Clean up any older waiting rooms hosted by the same playerId so ghost rooms never linger
+    for (const [oldCode, oldRoom] of this.rooms.entries()) {
+      if (
+        oldRoom.host.playerId === params.playerId &&
+        oldRoom.status === 'waiting' &&
+        oldRoom.guest === null
+      ) {
+        this.rooms.delete(oldCode);
+      }
+    }
     const existing = new Set(this.rooms.keys());
     const preferred = params.preferredCode ? normalizeRoomCode(params.preferredCode) : '';
     const code =
@@ -270,12 +281,26 @@ export class MultiplayerRoomManager {
     if (room.host.playerId === params.playerId) {
       room.host.connected = true;
       room.host.lastSeenAt = now;
+      if (params.callsign) {
+        room.host.callsign =
+          String(params.callsign).trim().slice(0, 16).toUpperCase() || room.host.callsign;
+      }
+      if (params.operative) {
+        room.host.operative = params.operative;
+      }
       room.updatedAt = now;
       return { ok: true, room, role: 'host' };
     }
     if (room.guest && room.guest.playerId === params.playerId) {
       room.guest.connected = true;
       room.guest.lastSeenAt = now;
+      if (params.callsign) {
+        room.guest.callsign =
+          String(params.callsign).trim().slice(0, 16).toUpperCase() || room.guest.callsign;
+      }
+      if (params.operative) {
+        room.guest.operative = params.operative;
+      }
       room.updatedAt = now;
       return { ok: true, room, role: 'guest' };
     }
@@ -539,6 +564,7 @@ export class MultiplayerRoomManager {
     }
 
     return {
+      eventId: `dmg_${now}_${Math.random().toString(36).slice(2, 8)}`,
       attackerRole: params.attackerRole,
       victimRole,
       weaponId: spec.id,

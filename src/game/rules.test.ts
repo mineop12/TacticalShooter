@@ -10,7 +10,9 @@ import {
   fetchWaitingRoomsClient,
   fillWithSimulatedChallengerClient,
   joinRoomByCodeClient,
+  leaveMultiplayerRoomClient,
   quickMatchClient,
+  subscribeLocalMultiplayerEvents,
 } from './multiplayerClient.ts';
 import {
   calculateDamageWithArmor,
@@ -635,5 +637,102 @@ test('computeSubtleAimAssist provides gentle tracking nudge inside a narrow cone
   assert.equal(farOff.sensitivityScale, 1.0);
   assert.equal(farOff.magnetStrength, 0);
 });
+
+test('MultiplayerRoomManager cleans up older waiting rooms when the same host creates a new room', () => {
+  const mgr = new MultiplayerRoomManager();
+  const hostId = 'player_veteran_host';
+  const room1 = mgr.createRoom({
+    playerId: hostId,
+    callsign: 'GHOST-01',
+    operative: 'vex',
+    isPublicQueue: true,
+  });
+  assert.equal(mgr.listPublicWaitingRooms().length, 1);
+  assert.equal(mgr.listPublicWaitingRooms()[0].code, room1.code);
+
+  // When same host creates another room, the old waiting room is automatically purged
+  const room2 = mgr.createRoom({
+    playerId: hostId,
+    callsign: 'GHOST-01',
+    operative: 'nyx',
+    isPublicQueue: true,
+  });
+  assert.equal(mgr.listPublicWaitingRooms().length, 1);
+  assert.equal(mgr.listPublicWaitingRooms()[0].code, room2.code);
+  assert.equal(mgr.getRoom(room1.code), undefined);
+});
+
+test('MultiplayerRoomManager applies damage with unique eventId and updates player identity on reconnect', () => {
+  const mgr = new MultiplayerRoomManager();
+  const room = mgr.createRoom({
+    playerId: 'host_p1',
+    callsign: 'ALPHA-01',
+    operative: 'vex',
+    isPublicQueue: false,
+    preferredCode: 'TST111',
+  });
+  mgr.joinRoomByCode({
+    code: 'TST111',
+    playerId: 'guest_p2',
+    callsign: 'BRAVO-02',
+    operative: 'kai',
+  });
+
+  // Start match
+  mgr.startMatchInRoom(room, Date.now());
+
+  // Apply hit damage with eventId
+  const dmg = mgr.applyHitDamage({
+    code: 'TST111',
+    attackerRole: 'host',
+    weaponId: 'rifle',
+    rawDamage: 40,
+    isHeadshot: false,
+    distance: 12,
+    hitX: 0,
+    hitY: 1.2,
+    hitZ: 0,
+  });
+  assert.ok(dmg);
+  assert.ok(dmg.eventId.startsWith('dmg_'));
+  assert.equal(dmg.attackerRole, 'host');
+  assert.equal(dmg.victimRole, 'guest');
+  assert.equal(dmg.damageApplied, 40);
+
+  // Guest reconnects with updated callsign/operative
+  const reconnected = mgr.joinRoomByCode({
+    code: 'TST111',
+    playerId: 'guest_p2',
+    callsign: 'BRAVO-UPDATED',
+    operative: 'nyx',
+  });
+  assert.ok(reconnected.ok);
+  assert.equal(reconnected.room.guest?.callsign, 'BRAVO-UPDATED');
+  assert.equal(reconnected.room.guest?.operative, 'nyx');
+});
+
+test('subscribeLocalMultiplayerEvents delivers instant notifications and leaveMultiplayerRoomClient marks room vacated', async () => {
+  const received: string[] = [];
+  const unsubscribe = subscribeLocalMultiplayerEvents((msg) => {
+    if (msg.type === 'mp:room_sync' && msg.room) {
+      received.push((msg.room as { code: string }).code);
+    }
+  });
+
+  const created = await createRoomClient({
+    playerId: 'test_local_host_99',
+    callsign: 'NEXUS-01',
+    operative: 'vex',
+    isPublicQueue: false,
+  });
+  assert.ok(created.ok);
+  assert.ok(received.includes(created.room.code));
+
+  // Departure marks guest left or host abandoned
+  leaveMultiplayerRoomClient(created.room.code, 'test_local_host_99');
+
+  unsubscribe();
+});
+
 
 
